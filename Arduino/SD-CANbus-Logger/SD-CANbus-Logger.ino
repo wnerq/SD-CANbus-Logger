@@ -1,12 +1,12 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V02
+  Firmware: V03
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V02 purpose:
+  V03 purpose:
     - Preserve the V01 SD-card read/write verification.
     - Add infrastructure Wi-Fi station connectivity while retaining the AP.
     - Store infrastructure Wi-Fi credentials in ESP32 NVS (Preferences).
@@ -52,13 +52,15 @@
     /                 Dashboard
     /api/status       System diagnostic snapshot
     /api/events       Recent diagnostic events
+    /api/http-errors  Recent HTTP 4xx/5xx requests
+    /api/loop-events  Recent loop timing anomalies
     /api/test         Run SD write/append/readback verification
     /api/client-error Browser-side fetch error telemetry
 
   Notes:
     - Remove the microSD card while flashing if required by the board.
     - Select the appropriate ESP32 Dev Module board definition.
-    - CAN/TWAI is intentionally not initialized in V02.
+    - CAN/TWAI is intentionally not initialized in V03.
 */
 
 #include <Arduino.h>
@@ -77,7 +79,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V02";
+static const char FIRMWARE_VERSION[] = "V03";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -97,8 +99,8 @@ static const int SD_SCK_PIN  = 14;
 static const int SD_MOSI_PIN = 15;
 static const int SD_MISO_PIN = 2;
 
-static const int CAN_RX_PIN = 26;  // Reserved; not initialized in V02.
-static const int CAN_TX_PIN = 27;  // Reserved; not initialized in V02.
+static const int CAN_RX_PIN = 26;  // Reserved; not initialized in V03.
+static const int CAN_TX_PIN = 27;  // Reserved; not initialized in V03.
 
 static const uint32_t SD_SPI_FREQUENCY = 4000000;
 static const char SD_TEST_DIRECTORY[] = "/diag";
@@ -110,6 +112,9 @@ static const char SD_TEST_FILE[] = "/diag/SDTEST.TXT";
 
 static const uint8_t EVENT_HISTORY_SIZE = 32;
 static const uint8_t MAX_BOOT_CHECKPOINTS = 12;
+static const uint8_t HTTP_ERROR_HISTORY_SIZE = 8;
+static const uint8_t LOOP_EVENT_HISTORY_SIZE = 8;
+static const uint32_t LOOP_DIAGNOSTIC_THRESHOLD_US = 100000; // 100 ms
 
 struct DiagnosticEvent {
   uint32_t uptimeMs;
@@ -125,12 +130,36 @@ struct BootCheckpoint {
   uint32_t internalFree;
 };
 
+struct HttpErrorRecord {
+  uint32_t uptimeMs;
+  uint16_t statusCode;
+  char method[8];
+  char uri[72];
+};
+
+struct LoopTimingRecord {
+  uint32_t uptimeMs;
+  uint32_t gapUs;
+  uint32_t durationUs;
+  uint16_t relatedHttpStatus;
+  char relatedHttpRoute[48];
+};
+
 DiagnosticEvent eventHistory[EVENT_HISTORY_SIZE];
 uint8_t eventHead = 0;   // Next position to write.
 uint8_t eventCount = 0;
 
 BootCheckpoint bootCheckpoints[MAX_BOOT_CHECKPOINTS];
 uint8_t bootCheckpointCount = 0;
+
+HttpErrorRecord httpErrorHistory[HTTP_ERROR_HISTORY_SIZE];
+uint8_t httpErrorHead = 0;
+uint8_t httpErrorCount = 0;
+
+LoopTimingRecord loopEventHistory[LOOP_EVENT_HISTORY_SIZE];
+uint8_t loopEventHead = 0;
+uint8_t loopEventCount = 0;
+uint32_t loopTimingEventCount = 0;
 
 // -----------------------------------------------------------------------------
 // Runtime objects
@@ -195,7 +224,7 @@ uint32_t httpNotFoundRequests = 0;
 uint32_t httpErrorResponses = 0;
 uint32_t httpLastDurationUs = 0;
 uint32_t httpMaxDurationUs = 0;
-char httpLastRoute[32] = "none";
+char httpLastRoute[80] = "none";
 uint16_t httpLastStatusCode = 0;
 
 uint32_t loopCount = 0;
@@ -217,6 +246,10 @@ void addEvent(const char *severity, const char *message);
 void captureBootCheckpoint(const char *name);
 void printBootCheckpoints();
 void printEvents();
+void printHttpErrors();
+void printLoopEvents();
+void addHttpError(const char *method, const char *uri, uint16_t statusCode);
+void addLoopTimingEvent();
 
 void startWiFi();
 void startStationConnection(const String &ssid, const String &password, bool saveCredentials);
@@ -234,10 +267,14 @@ void handleStatus();
 void handleEvents();
 void handleSDTest();
 void handleClientError();
+void handleHttpErrors();
+void handleLoopEvents();
 void handleNotFound();
 
 String makeStatusJson();
 String makeEventsJson();
+String makeHttpErrorsJson();
+String makeLoopEventsJson();
 String htmlPage();
 
 void serviceSerial();
@@ -250,7 +287,10 @@ String getResetReasonText();
 String getArduinoCoreVersion();
 String jsonEscape(const String &value);
 String getSystemHealth();
-void recordHttp(const char *route, uint32_t startUs, uint16_t statusCode);
+String getSystemHealthDetails();
+void printSystemHealthDetails();
+void recordHttp(const char *method, const char *route, uint32_t startUs, uint16_t statusCode);
+void printCommandEcho(const char *command);
 void sendHttpResponse(int statusCode, const char *contentType, const String &body);
 
 // -----------------------------------------------------------------------------
@@ -341,6 +381,13 @@ void loop() {
   if (loopPreviousStartUs != 0) {
     loopLastGapUs = loopStartUs - loopPreviousStartUs;
     if (loopLastGapUs > loopMaxGapUs) loopMaxGapUs = loopLastGapUs;
+
+    // At this point loopLastDurationUs belongs to the preceding loop, so the
+    // gap and duration describe the same start-to-start interval.
+    if (loopLastGapUs >= LOOP_DIAGNOSTIC_THRESHOLD_US ||
+        loopLastDurationUs >= LOOP_DIAGNOSTIC_THRESHOLD_US) {
+      addLoopTimingEvent();
+    }
   }
   loopPreviousStartUs = loopStartUs;
 
@@ -355,6 +402,7 @@ void loop() {
   if (loopLastDurationUs > loopMaxDurationUs) {
     loopMaxDurationUs = loopLastDurationUs;
   }
+
   loopCount++;
 }
 
@@ -394,6 +442,67 @@ void printEvents() {
     Serial.print(event.severity);
     Serial.print(F("  "));
     Serial.println(event.message);
+  }
+  Serial.println();
+}
+
+void addHttpError(const char *method, const char *uri, uint16_t statusCode) {
+  HttpErrorRecord &record = httpErrorHistory[httpErrorHead];
+  record.uptimeMs = millis() - bootMillis;
+  record.statusCode = statusCode;
+  snprintf(record.method, sizeof(record.method), "%s", method);
+  snprintf(record.uri, sizeof(record.uri), "%s", uri);
+  httpErrorHead = (httpErrorHead + 1) % HTTP_ERROR_HISTORY_SIZE;
+  if (httpErrorCount < HTTP_ERROR_HISTORY_SIZE) httpErrorCount++;
+}
+
+void printHttpErrors() {
+  Serial.println();
+  Serial.println(F("RECENT HTTP ERROR HISTORY"));
+  Serial.println(F("-------------------------"));
+  if (!httpErrorCount) {
+    Serial.println(F("No HTTP error responses recorded."));
+    return;
+  }
+  uint8_t first = (httpErrorHead + HTTP_ERROR_HISTORY_SIZE - httpErrorCount) % HTTP_ERROR_HISTORY_SIZE;
+  for (uint8_t i = 0; i < httpErrorCount; i++) {
+    const HttpErrorRecord &r = httpErrorHistory[(first + i) % HTTP_ERROR_HISTORY_SIZE];
+    Serial.print(formatUptime(r.uptimeMs)); Serial.print(F("  "));
+    Serial.print(r.method); Serial.print(' '); Serial.print(r.uri);
+    Serial.print(F("  HTTP ")); Serial.println(r.statusCode);
+  }
+  Serial.println();
+}
+
+void addLoopTimingEvent() {
+  LoopTimingRecord &record = loopEventHistory[loopEventHead];
+  record.uptimeMs = millis() - bootMillis;
+  record.gapUs = loopLastGapUs;
+  record.durationUs = loopLastDurationUs;
+  record.relatedHttpStatus = httpLastStatusCode;
+  snprintf(record.relatedHttpRoute, sizeof(record.relatedHttpRoute), "%s", httpLastRoute);
+  loopEventHead = (loopEventHead + 1) % LOOP_EVENT_HISTORY_SIZE;
+  if (loopEventCount < LOOP_EVENT_HISTORY_SIZE) loopEventCount++;
+  loopTimingEventCount++;
+}
+
+void printLoopEvents() {
+  Serial.println();
+  Serial.println(F("RECENT LOOP TIMING EVENTS (threshold 100 ms)"));
+  Serial.println(F("--------------------------------------------"));
+  if (!loopEventCount) {
+    Serial.println(F("No loop timing events recorded."));
+    return;
+  }
+  uint8_t first = (loopEventHead + LOOP_EVENT_HISTORY_SIZE - loopEventCount) % LOOP_EVENT_HISTORY_SIZE;
+  for (uint8_t i = 0; i < loopEventCount; i++) {
+    const LoopTimingRecord &r = loopEventHistory[(first + i) % LOOP_EVENT_HISTORY_SIZE];
+    Serial.print(formatUptime(r.uptimeMs));
+    Serial.print(F("  gap=")); Serial.print(r.gapUs);
+    Serial.print(F(" us  duration=")); Serial.print(r.durationUs);
+    Serial.print(F(" us  preceding HTTP context: "));
+    Serial.print(r.relatedHttpRoute); Serial.print(F(" / "));
+    Serial.println(r.relatedHttpStatus);
   }
   Serial.println();
 }
@@ -710,10 +819,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V02 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V03 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V02 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V03 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -858,6 +967,8 @@ void configureWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/events", HTTP_GET, handleEvents);
+  server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
+  server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
   server.on("/api/test", HTTP_GET, handleSDTest);
   server.on("/api/client-error", HTTP_POST, handleClientError);
   server.onNotFound(handleNotFound);
@@ -869,7 +980,7 @@ void sendHttpResponse(int statusCode, const char *contentType, const String &bod
   server.send(statusCode, contentType, body);
 }
 
-void recordHttp(const char *route, uint32_t startUs, uint16_t statusCode) {
+void recordHttp(const char *method, const char *route, uint32_t startUs, uint16_t statusCode) {
   uint32_t duration = micros() - startUs;
 
   httpRequests++;
@@ -879,7 +990,10 @@ void recordHttp(const char *route, uint32_t startUs, uint16_t statusCode) {
   snprintf(httpLastRoute, sizeof(httpLastRoute), "%s", route);
   httpLastStatusCode = statusCode;
 
-  if (statusCode >= 400) httpErrorResponses++;
+  if (statusCode >= 400) {
+    httpErrorResponses++;
+    addHttpError(method, route, statusCode);
+  }
 }
 
 void handleRoot() {
@@ -888,7 +1002,7 @@ void handleRoot() {
 
   String page = htmlPage();
   sendHttpResponse(200, "text/html", page);
-  recordHttp("GET /", startUs, 200);
+  recordHttp("GET", "/", startUs, 200);
 }
 
 void handleStatus() {
@@ -898,7 +1012,7 @@ void handleStatus() {
   refreshSDInformation();
   String json = makeStatusJson();
   sendHttpResponse(200, "application/json", json);
-  recordHttp("GET /api/status", startUs, 200);
+  recordHttp("GET", "/api/status", startUs, 200);
 }
 
 void handleEvents() {
@@ -907,7 +1021,7 @@ void handleEvents() {
 
   String json = makeEventsJson();
   sendHttpResponse(200, "application/json", json);
-  recordHttp("GET /api/events", startUs, 200);
+  recordHttp("GET", "/api/events", startUs, 200);
 }
 
 void handleSDTest() {
@@ -919,7 +1033,7 @@ void handleSDTest() {
   uint16_t code = result ? 200 : 500;
 
   sendHttpResponse(code, "application/json", json);
-  recordHttp("GET /api/test", startUs, code);
+  recordHttp("GET", "/api/test", startUs, code);
 }
 
 void handleClientError() {
@@ -936,7 +1050,7 @@ void handleClientError() {
   addEvent("WARN", message);
 
   sendHttpResponse(204, "text/plain", "");
-  recordHttp("POST /api/client-error", startUs, 204);
+  recordHttp("POST", "/api/client-error", startUs, 204);
 }
 
 void handleNotFound() {
@@ -944,9 +1058,27 @@ void handleNotFound() {
   httpNotFoundRequests++;
 
   String route = server.uri();
+  String method = server.method() == HTTP_POST ? "POST" :
+                  server.method() == HTTP_PUT ? "PUT" :
+                  server.method() == HTTP_DELETE ? "DELETE" :
+                  server.method() == HTTP_HEAD ? "HEAD" : "GET/OTHER";
   String response = "Not found: " + route;
   sendHttpResponse(404, "text/plain", response);
-  recordHttp("404", startUs, 404);
+  recordHttp(method.c_str(), route.c_str(), startUs, 404);
+}
+
+void handleHttpErrors() {
+  uint32_t startUs = micros();
+  String json = makeHttpErrorsJson();
+  sendHttpResponse(200, "application/json", json);
+  recordHttp("GET", "/api/http-errors", startUs, 200);
+}
+
+void handleLoopEvents() {
+  uint32_t startUs = micros();
+  String json = makeLoopEventsJson();
+  sendHttpResponse(200, "application/json", json);
+  recordHttp("GET", "/api/loop-events", startUs, 200);
 }
 
 // -----------------------------------------------------------------------------
@@ -1020,9 +1152,34 @@ String jsonEscape(const String &value) {
 
 String getSystemHealth() {
   if (!wifiApStarted || !sdReady || !sdTestPassed) return "FAIL";
-  if (sdWriteFailures || sdReadFailures || sdMountFailures || httpErrorResponses) return "WARN";
-  if (configuredStaSsid.length() > 0 && !wifiStaConnected) return "WARN";
+  if (!preferencesReady || !mdnsStarted || sdWriteFailures || sdReadFailures || sdMountFailures ||
+      httpErrorResponses || httpClientErrorReports ||
+      (configuredStaSsid.length() > 0 && !wifiStaConnected)) return "WARN";
   return "PASS";
+}
+
+String getSystemHealthDetails() {
+  String details;
+  details.reserve(220);
+  if (!wifiApStarted) details += "Access point failed to start; ";
+  if (!sdReady) details += "SD card is not mounted; ";
+  if (!sdTestPassed) details += "Latest SD verification has not passed; ";
+  if (!preferencesReady) details += "NVS Preferences unavailable; ";
+  if (!mdnsStarted) details += "mDNS responder is not running; ";
+  if (sdMountFailures) details += "SD mount failures=" + String(sdMountFailures) + "; ";
+  if (sdWriteFailures) details += "SD write failures=" + String(sdWriteFailures) + "; ";
+  if (sdReadFailures) details += "SD read failures=" + String(sdReadFailures) + "; ";
+  if (httpErrorResponses) details += "HTTP 4xx/5xx responses=" + String(httpErrorResponses) + "; ";
+  if (httpClientErrorReports) details += "Browser fetch error reports=" + String(httpClientErrorReports) + "; ";
+  if (configuredStaSsid.length() > 0 && !wifiStaConnected) details += "Configured infrastructure Wi-Fi is disconnected; ";
+  if (details.length() == 0) return "No active health warnings.";
+  details.remove(details.length() - 2);
+  return details;
+}
+
+void printSystemHealthDetails() {
+  Serial.print(F("Health detail:        "));
+  Serial.println(getSystemHealthDetails());
 }
 
 String makeStatusJson() {
@@ -1050,6 +1207,7 @@ String makeStatusJson() {
   json += "\"uptime\":\"" + formatUptime(millis() - bootMillis) + "\",";
   json += "\"resetReason\":\"" + getResetReasonText() + "\",";
   json += "\"health\":\"" + getSystemHealth() + "\",";
+  json += "\"healthDetails\":\"" + jsonEscape(getSystemHealthDetails()) + "\",";
 
   json += "\"heapFree\":" + String(freeHeap) + ",";
   json += "\"heapMinimum\":" + String(ESP.getMinFreeHeap()) + ",";
@@ -1117,12 +1275,15 @@ String makeStatusJson() {
   json += "\"httpLastStatusCode\":" + String(httpLastStatusCode) + ",";
   json += "\"httpLastDurationUs\":" + String(httpLastDurationUs) + ",";
   json += "\"httpMaxDurationUs\":" + String(httpMaxDurationUs) + ",";
+  json += "\"httpErrorHistoryCount\":" + String(httpErrorCount) + ",";
 
   json += "\"loopCount\":" + String(loopCount) + ",";
   json += "\"loopLastDurationUs\":" + String(loopLastDurationUs) + ",";
   json += "\"loopMaxDurationUs\":" + String(loopMaxDurationUs) + ",";
   json += "\"loopLastGapUs\":" + String(loopLastGapUs) + ",";
   json += "\"loopMaxGapUs\":" + String(loopMaxGapUs) + ",";
+  json += "\"loopTimingEventCount\":" + String(loopTimingEventCount) + ",";
+  json += "\"loopEventHistoryCount\":" + String(loopEventCount) + ",";
   json += "\"eventCount\":" + String(eventCount) + ",";
   json += "\"bootCheckpointCount\":" + String(bootCheckpointCount) + ",";
   json += "\"canInitialized\":false";
@@ -1149,6 +1310,43 @@ String makeEventsJson() {
     json += ",\"message\":\"" + jsonEscape(String(event.message)) + "\"}";
   }
 
+  json += "]}";
+  return json;
+}
+
+String makeHttpErrorsJson() {
+  String json;
+  json.reserve(1200);
+  json = "{\"errors\":[";
+  uint8_t first = (httpErrorHead + HTTP_ERROR_HISTORY_SIZE - httpErrorCount) % HTTP_ERROR_HISTORY_SIZE;
+  for (uint8_t i = 0; i < httpErrorCount; i++) {
+    const HttpErrorRecord &r = httpErrorHistory[(first + i) % HTTP_ERROR_HISTORY_SIZE];
+    if (i) json += ",";
+    json += "{\"uptimeMs\":" + String(r.uptimeMs);
+    json += ",\"uptime\":\"" + formatUptime(r.uptimeMs) + "\"";
+    json += ",\"method\":\"" + String(r.method) + "\"";
+    json += ",\"uri\":\"" + jsonEscape(String(r.uri)) + "\"";
+    json += ",\"status\":" + String(r.statusCode) + "}";
+  }
+  json += "]}";
+  return json;
+}
+
+String makeLoopEventsJson() {
+  String json;
+  json.reserve(1500);
+  json = "{\"events\":[";
+  uint8_t first = (loopEventHead + LOOP_EVENT_HISTORY_SIZE - loopEventCount) % LOOP_EVENT_HISTORY_SIZE;
+  for (uint8_t i = 0; i < loopEventCount; i++) {
+    const LoopTimingRecord &r = loopEventHistory[(first + i) % LOOP_EVENT_HISTORY_SIZE];
+    if (i) json += ",";
+    json += "{\"uptimeMs\":" + String(r.uptimeMs);
+    json += ",\"uptime\":\"" + formatUptime(r.uptimeMs) + "\"";
+    json += ",\"gapUs\":" + String(r.gapUs);
+    json += ",\"durationUs\":" + String(r.durationUs);
+    json += ",\"httpStatus\":" + String(r.relatedHttpStatus);
+    json += ",\"httpRoute\":\"" + jsonEscape(String(r.relatedHttpRoute)) + "\"}";
+  }
   json += "]}";
   return json;
 }
@@ -1196,12 +1394,13 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V02</p>
+<p class="sub">System dashboard - V03</p>
 
 <div class="grid">
   <section class="card">
     <h2>System health</h2>
     <div class="row"><span>Overall</span><span class="health" id="health">--</span></div>
+    <div class="row"><span>Assessment</span><span class="value" id="healthDetails">--</span></div>
     <div class="row"><span>Firmware</span><span class="value" id="firmware">--</span></div>
     <div class="row"><span>Build</span><span class="value" id="build">--</span></div>
     <div class="row"><span>Uptime</span><span class="value" id="uptime">--</span></div>
@@ -1278,6 +1477,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>HTTP error responses</span><span class="value" id="httpErrorResponses">--</span></div>
     <div class="row"><span>Last route / status</span><span class="value" id="httpLastRoute">--</span></div>
     <div class="row"><span>Last / max handler time</span><span class="value" id="httpTiming">--</span></div>
+    <div id="httpErrors" class="small muted">No HTTP error history loaded.</div>
   </section>
 
   <section class="card">
@@ -1285,6 +1485,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>Loop iterations</span><span class="value" id="loopCount">--</span></div>
     <div class="row"><span>Last / max loop duration</span><span class="value" id="loopDuration">--</span></div>
     <div class="row"><span>Last / max loop gap</span><span class="value" id="loopGap">--</span></div>
+    <div class="row"><span>Timing events captured</span><span class="value" id="loopTimingEvents">--</span></div>
+    <div id="loopEvents" class="small muted">No loop timing history loaded.</div>
     <div class="row"><span>Diagnostic events retained</span><span class="value" id="eventCount">--</span></div>
     <div class="row"><span>CAN</span><span class="value">Not initialized</span></div>
   </section>
@@ -1309,7 +1511,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. CAN/TWAI is intentionally inactive in V02.</p>
+<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI is intentionally inactive in V03.</p>
 </main>
 
 <script>
@@ -1336,6 +1538,7 @@ async function refreshStatus(){
   try{
     const s=await fetchJson('/api/status');
     setText('health',s.health);
+    setText('healthDetails',s.healthDetails);
     setText('firmware',s.firmware);
     setText('build',s.build);
     setText('uptime',s.uptime);
@@ -1383,6 +1586,7 @@ async function refreshStatus(){
     setText('httpErrorResponses',s.httpErrorResponses);
     setText('httpLastRoute',s.httpLastRoute+' / '+s.httpLastStatusCode);
     setText('httpTiming',s.httpLastDurationUs+' / '+s.httpMaxDurationUs+' us');
+    setText('loopTimingEvents',s.loopTimingEventCount);
     setText('loopCount',s.loopCount);
     setText('loopDuration',s.loopLastDurationUs+' / '+s.loopMaxDurationUs+' us');
     setText('loopGap',s.loopLastGapUs+' / '+s.loopMaxGapUs+' us');
@@ -1419,10 +1623,32 @@ async function runTest(){
     await refreshEvents();
   }catch(e){setText('message','SD test request failed: '+e.message);reportBrowserError('/api/test',e);}
 }
+async function refreshHttpErrors(){
+  try{
+    const data=await fetchJson('/api/http-errors');
+    const host=document.getElementById('httpErrors');
+    if(!data.errors.length){host.textContent='No HTTP error responses recorded.';return;}
+    host.textContent=data.errors.map(e=>e.uptime+'  '+e.method+' '+e.uri+'  HTTP '+e.status).join('\n');
+    host.style.whiteSpace='pre-wrap';
+  }catch(e){document.getElementById('httpErrors').textContent='HTTP history unavailable: '+e.message;}
+}
+async function refreshLoopEvents(){
+  try{
+    const data=await fetchJson('/api/loop-events');
+    const host=document.getElementById('loopEvents');
+    if(!data.events.length){host.textContent='No loop timing events recorded.';return;}
+    host.textContent=data.events.map(e=>e.uptime+'  gap '+e.gapUs+' us; duration '+e.durationUs+' us; HTTP '+e.httpRoute+' / '+e.httpStatus).join('\n');
+    host.style.whiteSpace='pre-wrap';
+  }catch(e){document.getElementById('loopEvents').textContent='Loop history unavailable: '+e.message;}
+}
 refreshStatus();
 refreshEvents();
+refreshHttpErrors();
+refreshLoopEvents();
 setInterval(refreshStatus,5000);
 setInterval(refreshEvents,15000);
+setInterval(refreshHttpErrors,15000);
+setInterval(refreshLoopEvents,15000);
 </script>
 </body>
 </html>
@@ -1444,7 +1670,10 @@ void serviceSerial() {
     if (c == '\n') {
       if (!serialCommandOverflow) {
         serialCommandBuffer[serialCommandLength] = '\0';
-        if (serialCommandLength > 0) processSerialCommand(serialCommandBuffer);
+        if (serialCommandLength > 0) {
+          printCommandEcho(serialCommandBuffer);
+          processSerialCommand(serialCommandBuffer);
+        }
       } else {
         Serial.println(F("[SERIAL] Command too long; discarded."));
       }
@@ -1464,6 +1693,23 @@ void serviceSerial() {
   }
 }
 
+void printCommandEcho(const char *command) {
+  Serial.print(F("> "));
+  if (!strncmp(command, "wifi connect ", 13)) {
+    const char *credentials = command + 13;
+    const char *separator = strchr(credentials, '|');
+    if (separator) {
+      Serial.print(F("wifi connect "));
+      for (const char *p = credentials; p < separator; ++p) Serial.write(*p);
+      Serial.println(F("|[PASSWORD HIDDEN]"));
+    } else {
+      Serial.println(F("wifi connect [CREDENTIALS HIDDEN]"));
+    }
+  } else {
+    Serial.println(command);
+  }
+}
+
 void processSerialCommand(char *command) {
   if (!strcmp(command, "help")) {
     printHelp();
@@ -1471,6 +1717,10 @@ void processSerialCommand(char *command) {
     printStatus();
   } else if (!strcmp(command, "events")) {
     printEvents();
+  } else if (!strcmp(command, "httperrors")) {
+    printHttpErrors();
+  } else if (!strcmp(command, "loopevents")) {
+    printLoopEvents();
   } else if (!strcmp(command, "checkpoints")) {
     printBootCheckpoints();
   } else if (!strcmp(command, "sdtest")) {
@@ -1514,8 +1764,7 @@ void processSerialCommand(char *command) {
     String password(separator + 1);
     startStationConnection(ssid, password, true);
   } else {
-    Serial.print(F("Unknown command: "));
-    Serial.println(command);
+    Serial.println(F("Unknown command."));
     printHelp();
   }
 }
@@ -1527,6 +1776,8 @@ void printHelp() {
   Serial.println(F("help                         Show commands"));
   Serial.println(F("status                       Full system status"));
   Serial.println(F("events                       Recent diagnostic event history"));
+  Serial.println(F("httperrors                   Recent HTTP 4xx/5xx requests"));
+  Serial.println(F("loopevents                   Recent loop timing anomalies (>=100 ms)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
   Serial.println(F("wifi status                  Show AP and infrastructure status"));
@@ -1564,6 +1815,7 @@ void printStatus() {
   Serial.print(F("Uptime:               ")); Serial.println(formatUptime(millis() - bootMillis));
   Serial.print(F("Reset reason:         ")); Serial.println(getResetReasonText());
   Serial.print(F("System health:        ")); Serial.println(getSystemHealth());
+  printSystemHealthDetails();
 
   Serial.println();
   Serial.println(F("MEMORY"));
@@ -1606,6 +1858,7 @@ void printStatus() {
   Serial.print(F("Last route:           ")); Serial.println(httpLastRoute);
   Serial.print(F("Last status:          ")); Serial.println(httpLastStatusCode);
   Serial.print(F("Last/max handler:     ")); Serial.print(httpLastDurationUs); Serial.print(F(" / ")); Serial.print(httpMaxDurationUs); Serial.println(F(" us"));
+  Serial.print(F("HTTP error history:   ")); Serial.print(httpErrorCount); Serial.print(F(" retained; ")); Serial.println(httpErrorResponses);
 
   Serial.println();
   Serial.println(F("MAIN LOOP"));
@@ -1613,6 +1866,7 @@ void printStatus() {
   Serial.print(F("Loop iterations:      ")); Serial.println(loopCount);
   Serial.print(F("Last/max duration:    ")); Serial.print(loopLastDurationUs); Serial.print(F(" / ")); Serial.print(loopMaxDurationUs); Serial.println(F(" us"));
   Serial.print(F("Last/max loop gap:    ")); Serial.print(loopLastGapUs); Serial.print(F(" / ")); Serial.print(loopMaxGapUs); Serial.println(F(" us"));
+  Serial.print(F("Loop timing events:   ")); Serial.print(loopTimingEventCount); Serial.print(F(" total; ")); Serial.print(loopEventCount); Serial.println(F(" retained"));
 
   Serial.println();
   Serial.print(F("Diagnostic events:    ")); Serial.println(eventCount);
