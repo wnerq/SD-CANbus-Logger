@@ -1,12 +1,12 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V04
+  Firmware: V05
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V04 purpose:
+  V05 purpose:
     - Preserve the V03 Wi-Fi, SD, HTTP, and diagnostic foundation.
     - Distinguish Wi-Fi CONNECTING from an actual disconnected fault.
     - Drive the onboard WS2812-compatible RGB LED on GPIO4 using the
@@ -14,7 +14,8 @@
     - Provide a subtle 10-second healthy heartbeat and subsystem fault codes.
     - Maintain bounded fault-event history and a bounded SD-write queue.
     - Append fault and recovery events to /diag/FAULTS.CSV.
-    - Keep CAN/TWAI inactive; CAN fault states are reserved for later versions.
+    - Initialize native ESP32 TWAI at 250 kbit/s in listen-only mode.
+    - Provide controlled software reset and read-only SD file inspection.
 
   SD pin assignments:
     CS   = GPIO13
@@ -22,7 +23,7 @@
     MOSI = GPIO15
     MISO = GPIO2
 
-  CAN pin assignments reserved for a later revision:
+  CAN pin assignments:
     RX = GPIO26
     TX = GPIO27
 
@@ -37,6 +38,11 @@
     checkpoints
     sdtest
     sd remount
+    reset
+    ls [path]
+    cat <path>
+    head <path> [lines]
+    tail <path> [lines]
     wifi status
     wifi connect SSID|PASSWORD
     wifi disconnect
@@ -62,13 +68,18 @@
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
     /api/faults       Active faults and recent fault/recovery events
+    /api/files         List files in an approved SD directory
+    /api/file          View an SD file as text
+    /download          Download an SD file
+    /api/reset         Request a controlled software restart
     /api/test         Run SD write/append/readback verification
     /api/client-error Browser-side fetch error telemetry
 
   Notes:
     - Remove the microSD card while flashing if required by the board.
     - Select the appropriate ESP32 Dev Module board definition.
-    - CAN/TWAI is intentionally not initialized in V04.
+    - CAN/TWAI starts at 250 kbit/s in listen-only mode. The driver RX queue is
+      drained and frames discarded; V05 only drains/discards frames; V06 adds frame decoding, timestamps, and acquisition counters.
     - GPIO4 drives the onboard WS2812-compatible addressable RGB LED.
 */
 
@@ -84,13 +95,14 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <esp32-hal-rgb-led.h>
+#include <driver/twai.h>
 
 // -----------------------------------------------------------------------------
 // Firmware identity and project configuration
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V04";
+static const char FIRMWARE_VERSION[] = "V05";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -110,8 +122,9 @@ static const int SD_SCK_PIN  = 14;
 static const int SD_MOSI_PIN = 15;
 static const int SD_MISO_PIN = 2;
 
-static const int CAN_RX_PIN = 26;  // Reserved; not initialized in V04.
-static const int CAN_TX_PIN = 27;  // Reserved; not initialized in V04.
+static const int CAN_RX_PIN = 26;
+static const int CAN_TX_PIN = 27;
+static const uint32_t CAN_BITRATE = 250000;
 
 // Onboard addressable RGB LED: GPIO4 is the WS2812 data input.
 static const int RGB_LED_DATA_PIN = 4;
@@ -269,6 +282,26 @@ bool mdnsStarted = false;
 bool sdReady = false;
 bool sdTestPassed = false;
 bool sdTestRunning = false;
+bool sdOperationActive = false;
+uint32_t sdFileListRequests = 0;
+uint32_t sdFileReadRequests = 0;
+uint32_t sdFileDownloadRequests = 0;
+uint32_t sdFileOperationFailures = 0;
+
+bool canDriverInstalled = false;
+bool canInitialized = false;
+bool canRecoveryRequested = false;
+String canStateText = "NOT INITIALIZED";
+uint32_t canInitAttempts = 0;
+uint32_t canInitFailures = 0;
+uint32_t canBusOffCount = 0;
+uint32_t canRecoveryCount = 0;
+uint32_t canRecoveryAttempts = 0;
+uint32_t canRxQueueFullCount = 0;
+bool canBusOffLatched = false;
+uint32_t canLastError = 0;
+uint32_t canFramesDiscarded = 0;
+uint32_t canLastStatePollMs = 0;
 
 String configuredStaSsid;
 String configuredStaPassword;  // Never printed or returned by an endpoint.
@@ -372,6 +405,20 @@ void printWiFiStatus();
 
 void initializeSDCard();
 void remountSDCard();
+bool isAllowedSDPath(const String &path, bool allowDirectory);
+bool isTextDiagnosticFile(const String &path);
+void printSDDirectory(const char *path);
+void printSDFile(const char *path, const char *mode, uint16_t lineCount);
+void handleFileList();
+void handleFileView();
+void handleFileDownload();
+void handleResetRequest();
+void requestSoftwareReset(const char *source);
+void flushPendingFaultEvents(uint32_t timeoutMs);
+void initializeCANController();
+void updateCANState();
+void serviceCANReceiveQueue();
+const char *getCANStateText();
 void refreshSDInformation();
 bool runSDTest();
 
@@ -464,6 +511,9 @@ WiFi.onEvent(
   initializeSDCard();
   captureBootCheckpoint("SD initialized");
 
+  initializeCANController();
+  captureBootCheckpoint("CAN initialized");
+
   configureWebServer();
   server.begin();
   addEvent("INFO", "HTTP server started");
@@ -511,6 +561,8 @@ void loop() {
   server.handleClient();
   serviceSerial();
   updateWiFiState();
+  serviceCANReceiveQueue();
+  updateCANState();
   startMDNSIfNeeded();
   serviceFaultLog();
   updateLed();
@@ -812,7 +864,7 @@ bool writeFaultEvent(const FaultEventRecord &record) {
 }
 
 void serviceFaultLog() {
-  if (!sdReady) return;
+  if (!sdReady || sdOperationActive) return;
   uint32_t now = millis();
   if (nextFaultLogRetryMs != 0 && (int32_t)(now - nextFaultLogRetryMs) < 0) return;
 
@@ -864,13 +916,9 @@ void printFaults() {
   }
   if (!anyActive) Serial.println(F("  None"));
 
-Serial.print(F("Fault log:            "));
-if (faultLogReady) {
-  Serial.println(FAULT_LOG_FILE);
-} else {
-  Serial.println(F("NOT READY"));
-}
-
+  Serial.print(F("Fault log:            "));
+  if (faultLogReady) Serial.println(FAULT_LOG_FILE);
+  else Serial.println(F("NOT READY"));
   Serial.print(F("Queued events:        ")); Serial.println(faultQueueCount);
   Serial.print(F("Queue drops:          ")); Serial.println(faultQueueDropCount);
   Serial.print(F("Events written:       ")); Serial.println(faultLogWriteCount);
@@ -943,6 +991,439 @@ void handleFaults() {
   String json = makeFaultsJson();
   sendHttpResponse(200, "application/json", json);
   recordHttp("GET", "/api/faults", startUs, 200);
+}
+
+
+// -----------------------------------------------------------------------------
+// Read-only SD file inspection
+// -----------------------------------------------------------------------------
+
+bool isAllowedSDPath(const String &path, bool allowDirectory) {
+  if (path.length() == 0 || path.length() > 96) return false;
+  if (path.indexOf("..") >= 0 || path.indexOf('\\') >= 0 || path.indexOf("//") >= 0) return false;
+  if (path == "/diag") return allowDirectory;
+  if (!path.startsWith("/diag/")) return false;
+  // Restrict inspection to the diagnostic tree. No hidden traversal or
+  // absolute-volume paths are accepted.
+  return true;
+}
+
+bool isTextDiagnosticFile(const String &path) {
+  String lower = path;
+  lower.toLowerCase();
+  return lower.endsWith(".csv") || lower.endsWith(".txt") ||
+         lower.endsWith(".log") || lower.endsWith(".json");
+}
+
+void printSDDirectory(const char *path) {
+  if (!sdReady || sdOperationActive) {
+    Serial.println(F("[SD] Unavailable or busy."));
+    return;
+  }
+  String directoryPath(path);
+  if (!isAllowedSDPath(directoryPath, true)) {
+    Serial.println(F("[SD] Path rejected. Only /diag and its contents are accessible."));
+    return;
+  }
+  sdOperationActive = true;
+  sdFileListRequests++;
+  File dir = SD.open(directoryPath.c_str());
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    sdOperationActive = false;
+    Serial.println(F("[SD] Directory open failed."));
+    sdFileOperationFailures++;
+    return;
+  }
+  Serial.print(F("\nSD DIRECTORY: "));
+  Serial.println(directoryPath);
+  File entry = dir.openNextFile();
+  uint16_t count = 0;
+  while (entry) {
+    String name = entry.name();
+    Serial.print(entry.isDirectory() ? F("DIR  ") : F("FILE "));
+    Serial.print(entry.isDirectory() ? 0 : (unsigned long)entry.size());
+    Serial.print(F("  "));
+    Serial.println(name);
+    entry.close();
+    count++;
+    entry = dir.openNextFile();
+    if ((count % 8) == 0) yield();
+  }
+  dir.close();
+  Serial.print(F("Entries: "));
+  Serial.println(count);
+  sdOperationActive = false;
+}
+
+void printSDFile(const char *path, const char *mode, uint16_t lineCount) {
+  if (!sdReady || sdOperationActive) {
+    Serial.println(F("[SD] Unavailable or busy."));
+    return;
+  }
+  String filePath(path);
+  if (!isAllowedSDPath(filePath, false) || !isTextDiagnosticFile(filePath)) {
+    Serial.println(F("[SD] Path rejected. Use a text file inside /diag (.csv, .txt, .log, .json)."));
+    return;
+  }
+  sdOperationActive = true;
+  uint32_t started = millis();
+  File file = SD.open(filePath.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    sdOperationActive = false;
+    sdFileOperationFailures++;
+    sdReadFailures++;
+    Serial.println(F("[SD] File open failed."));
+    return;
+  }
+
+  const uint32_t fileSize = file.size();
+  Serial.print(F("\n--- "));
+  Serial.print(filePath);
+  Serial.print(F(" ("));
+  Serial.print(fileSize);
+  Serial.println(F(" bytes) ---"));
+
+  if (!strcmp(mode, "tail")) {
+    if (lineCount < 1) lineCount = 10;
+    if (lineCount > 50) lineCount = 50;
+    uint32_t starts[50];
+    uint8_t found = 0;
+    uint32_t pos = fileSize;
+    if (pos > 0) {
+      file.seek(pos - 1);
+      if (file.read() == '\n') pos--;
+    }
+    while (pos > 0 && found < lineCount) {
+      file.seek(pos - 1);
+      int c = file.read();
+      if (c == '\n') starts[found++] = pos;
+      pos--;
+    }
+    if (found < lineCount && pos == 0 && found < 50) starts[found++] = 0;
+    for (int i = (int)found - 1; i >= 0; --i) {
+      file.seek(starts[i]);
+      while (file.available()) {
+        int c = file.read();
+        if (c < 0) break;
+        Serial.write((uint8_t)c);
+        if (c == '\n') break;
+      }
+      if ((i % 4) == 0) yield();
+    }
+  } else {
+    uint16_t lines = 0;
+    while (file.available()) {
+      int c = file.read();
+      if (c < 0) break;
+      Serial.write((uint8_t)c);
+      if (c == '\n') {
+        lines++;
+        if (!strcmp(mode, "head") && lines >= lineCount) break;
+      }
+      if ((file.position() % 256) == 0) yield();
+    }
+  }
+  file.close();
+  sdReadOperations++;
+  sdLastReadDurationMs = millis() - started;
+  if (sdLastReadDurationMs > sdMaxReadDurationMs) sdMaxReadDurationMs = sdLastReadDurationMs;
+  sdTotalReadDurationMs += sdLastReadDurationMs;
+  Serial.println(F("\n--- END ---"));
+  sdOperationActive = false;
+}
+
+void handleFileList() {
+  uint32_t started = micros();
+  String path = server.hasArg("path") ? server.arg("path") : "/diag";
+  if (!sdReady || !isAllowedSDPath(path, true)) {
+    sendHttpResponse(sdReady ? 400 : 503, "application/json", "{\"error\":\"SD unavailable or path rejected\"}");
+    sdFileOperationFailures++;
+    recordHttp("GET", "/api/files", started, sdReady ? 400 : 503);
+    return;
+  }
+  if (sdOperationActive) {
+    sendHttpResponse(503, "application/json", "{\"error\":\"SD busy\"}");
+    recordHttp("GET", "/api/files", started, 503);
+    return;
+  }
+  sdOperationActive = true;
+  sdFileListRequests++;
+  String json = "{\"path\":\"" + jsonEscape(path) + "\",\"entries\":[";
+  File dir = SD.open(path.c_str());
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    sdOperationActive = false;
+    sdFileOperationFailures++;
+    sendHttpResponse(404, "application/json", "{\"error\":\"Directory not found\"}");
+    recordHttp("GET", "/api/files", started, 404);
+    return;
+  }
+  bool first = true;
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (!first) json += ',';
+    first = false;
+    String name = entry.name();
+    json += "{\"name\":\"" + jsonEscape(name) + "\",\"directory\":" + String(entry.isDirectory() ? "true" : "false");
+    json += ",\"size\":" + String(entry.isDirectory() ? 0 : entry.size()) + "}";
+    entry.close();
+    entry = dir.openNextFile();
+    if (json.length() > 5000) break;
+  }
+  dir.close();
+  json += "]}";
+  sdOperationActive = false;
+  sendHttpResponse(200, "application/json", json);
+  recordHttp("GET", "/api/files", started, 200);
+}
+
+void handleFileView() {
+  uint32_t started = micros();
+  String path = server.arg("path");
+  if (!sdReady || !isAllowedSDPath(path, false) || !isTextDiagnosticFile(path) || sdOperationActive) {
+    int code = !sdReady ? 503 : (sdOperationActive ? 503 : 400);
+    sendHttpResponse(code, "text/plain", "SD unavailable, busy, or path rejected");
+    sdFileOperationFailures++;
+    recordHttp("GET", "/api/file", started, code);
+    return;
+  }
+  sdOperationActive = true;
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    sdOperationActive = false;
+    sdFileOperationFailures++;
+    sendHttpResponse(404, "text/plain", "File not found");
+    recordHttp("GET", "/api/file", started, 404);
+    return;
+  }
+  sdFileReadRequests++;
+  server.sendHeader("Cache-Control", "no-store");
+  String filename = path.substring(path.lastIndexOf('/') + 1);
+  filename.replace("\"", "_"); filename.replace("\r", "_"); filename.replace("\n", "_");
+  server.sendHeader("Content-Disposition", "inline; filename=\"" + filename + "\"");
+  size_t expected = file.size();
+  size_t sent = server.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
+  sdOperationActive = false;
+  if (sent != expected) sdFileOperationFailures++;
+  recordHttp("GET", "/api/file", started, sent == expected ? 200 : 500);
+}
+
+void handleFileDownload() {
+  uint32_t started = micros();
+  String path = server.arg("path");
+  if (!sdReady || !isAllowedSDPath(path, false) || sdOperationActive) {
+    int code = !sdReady ? 503 : (sdOperationActive ? 503 : 400);
+    sendHttpResponse(code, "text/plain", "SD unavailable, busy, or path rejected");
+    sdFileOperationFailures++;
+    recordHttp("GET", "/download", started, code);
+    return;
+  }
+  sdOperationActive = true;
+  File file = SD.open(path.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    if (file) file.close();
+    sdOperationActive = false;
+    sdFileOperationFailures++;
+    sendHttpResponse(404, "text/plain", "File not found");
+    recordHttp("GET", "/download", started, 404);
+    return;
+  }
+  String filename = path.substring(path.lastIndexOf('/') + 1);
+  filename.replace("\"", "_"); filename.replace("\r", "_"); filename.replace("\n", "_");
+  sdFileDownloadRequests++;
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+  size_t expected = file.size();
+  size_t sent = server.streamFile(file, "application/octet-stream");
+  file.close();
+  sdOperationActive = false;
+  if (sent != expected) sdFileOperationFailures++;
+  recordHttp("GET", "/download", started, sent == expected ? 200 : 500);
+}
+
+void flushPendingFaultEvents(uint32_t timeoutMs) {
+  uint32_t started = millis();
+  while (sdReady && faultQueueCount > 0 && millis() - started < timeoutMs) {
+    uint8_t before = faultQueueCount;
+    serviceFaultLog();
+    if (faultQueueCount == before && !faultLogReady) break;
+    delay(1);
+  }
+}
+
+void requestSoftwareReset(const char *source) {
+  Serial.print(F("[SYSTEM] Software reset requested through "));
+  Serial.println(source);
+  addEvent("WARN", "Software reset requested");
+  flushPendingFaultEvents(1000);
+  Serial.flush();
+  delay(250);
+  ESP.restart();
+}
+
+void handleResetRequest() {
+  uint32_t started = micros();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(202, "text/plain", "Software restart requested");
+  recordHttp("POST", "/api/reset", started, 202);
+  flushPendingFaultEvents(1000);
+  delay(250);
+  ESP.restart();
+}
+
+// -----------------------------------------------------------------------------
+// Native ESP32 TWAI controller: fixed 250 kbit/s, listen-only
+// -----------------------------------------------------------------------------
+
+const char *getCANStateText() {
+  return canStateText.c_str();
+}
+
+void initializeCANController() {
+  canInitAttempts++;
+  canStateText = "INITIALIZING";
+  canInitialized = false;
+  canRecoveryRequested = false;
+
+  twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
+      (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+  // A small driver queue is drained in the main loop. V05 discards frames at
+  // this boundary; V06 will add bounded application acquisition and logging.
+  general.rx_queue_len = 8;
+  general.tx_queue_len = 0;
+  general.alerts_enabled = TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_BUS_OFF |
+                           TWAI_ALERT_RECOVERY_IN_PROGRESS | TWAI_ALERT_BUS_RECOVERED;
+  twai_timing_config_t timing = TWAI_TIMING_CONFIG_250KBITS();
+  twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  esp_err_t result = twai_driver_install(&general, &timing, &filter);
+  if (result != ESP_OK) {
+    canInitFailures++;
+    canLastError = (uint32_t)result;
+    canStateText = "INSTALL FAILED";
+    setFault(FAULT_CAN_DRIVER, "CAN", 1, "TWAI driver installation failed");
+    Serial.printf("[CAN] TWAI driver install failed: 0x%X\n", (unsigned)result);
+    return;
+  }
+  canDriverInstalled = true;
+
+  result = twai_start();
+  if (result != ESP_OK) {
+    canInitFailures++;
+    canLastError = (uint32_t)result;
+    canStateText = "START FAILED";
+    setFault(FAULT_CAN_DRIVER, "CAN", 2, "TWAI controller failed to start");
+    Serial.printf("[CAN] TWAI start failed: 0x%X\n", (unsigned)result);
+    twai_driver_uninstall();
+    canDriverInstalled = false;
+    return;
+  }
+
+  canInitialized = true;
+  canStateText = "RUNNING - LISTEN ONLY";
+  clearFault(FAULT_CAN_DRIVER, "TWAI controller initialized successfully");
+  addEvent("INFO", "TWAI running at 250 kbit/s in listen-only mode");
+  Serial.println(F("[CAN] TWAI initialized: 250 kbit/s, LISTEN-ONLY."));
+  Serial.print(F("[CAN] RX GPIO")); Serial.print(CAN_RX_PIN);
+  Serial.print(F("; TX GPIO")); Serial.println(CAN_TX_PIN);
+}
+
+void serviceCANReceiveQueue() {
+  if (!canDriverInstalled || !canInitialized) return;
+  twai_message_t discarded;
+  // Bounded drain: prevent the TWAI driver's small RX queue from filling while
+  // V05 intentionally has no frame acquisition pipeline.
+  for (uint8_t i = 0; i < 8; i++) {
+    if (twai_receive(&discarded, 0) != ESP_OK) break;
+    canFramesDiscarded++;
+  }
+}
+
+void updateCANState() {
+  if (!canDriverInstalled) return;
+  if (millis() - canLastStatePollMs < 100) return;
+  canLastStatePollMs = millis();
+  twai_status_info_t info;
+  esp_err_t result = twai_get_status_info(&info);
+  if (result != ESP_OK) {
+    canInitialized = false;
+    canLastError = (uint32_t)result;
+    canStateText = "STATUS ERROR";
+    if (!isFaultActive(FAULT_CAN_DRIVER)) {
+      setFault(FAULT_CAN_DRIVER, "CAN", 3, "TWAI status query failed");
+    }
+    return;
+  }
+
+  uint32_t alerts = 0;
+  if (twai_read_alerts(&alerts, 0) == ESP_OK && (alerts & TWAI_ALERT_RX_QUEUE_FULL)) {
+    canRxQueueFullCount++;
+  }
+
+  switch (info.state) {
+    case TWAI_STATE_RUNNING:
+      canInitialized = true;
+      canStateText = "RUNNING - LISTEN ONLY";
+      if (canRecoveryRequested) canRecoveryCount++;
+      canRecoveryRequested = false;
+      canBusOffLatched = false;
+      if (isFaultActive(FAULT_CAN_DRIVER)) {
+        clearFault(FAULT_CAN_DRIVER, "TWAI controller returned to running state");
+      }
+      break;
+    case TWAI_STATE_BUS_OFF:
+      canInitialized = false;
+      canStateText = "BUS OFF";
+      if (!canBusOffLatched) {
+        canBusOffCount++;
+        canBusOffLatched = true;
+      }
+      if (!canRecoveryRequested) {
+        esp_err_t recovery = twai_initiate_recovery();
+        canLastError = (uint32_t)recovery;
+        canRecoveryRequested = (recovery == ESP_OK);
+        if (canRecoveryRequested) {
+          canRecoveryAttempts++;
+          canStateText = "RECOVERING";
+          enqueueFaultEvent("CAN", "RECOVERY_ATTEMPT", 4, "TWAI bus-off recovery requested");
+        } else {
+          setFault(FAULT_CAN_DRIVER, "CAN", 4, "TWAI bus-off recovery request failed");
+        }
+      }
+      if (!isFaultActive(FAULT_CAN_DRIVER)) {
+        setFault(FAULT_CAN_DRIVER, "CAN", 4, "TWAI controller entered bus-off state");
+      }
+      break;
+    case TWAI_STATE_RECOVERING:
+      canInitialized = false;
+      canStateText = "RECOVERING";
+      break;
+    case TWAI_STATE_STOPPED:
+      canInitialized = false;
+      canStateText = canRecoveryRequested ? "RECOVERY RESTARTING" : "STOPPED";
+      if (!canRecoveryRequested && !isFaultActive(FAULT_CAN_DRIVER)) {
+        setFault(FAULT_CAN_DRIVER, "CAN", 6, "TWAI controller stopped unexpectedly");
+      }
+      if (canRecoveryRequested) {
+        esp_err_t restartResult = twai_start();
+        canLastError = (uint32_t)restartResult;
+        if (restartResult != ESP_OK) {
+          canStateText = "RESTART FAILED";
+          setFault(FAULT_CAN_DRIVER, "CAN", 5, "TWAI restart after bus-off recovery failed");
+          canRecoveryRequested = false;
+        }
+      }
+      break;
+    default:
+      canInitialized = false;
+      canStateText = "UNKNOWN STATE";
+      setFault(FAULT_CAN_DRIVER, "CAN", 7, "TWAI controller reported an unknown state");
+      break;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -1361,8 +1842,8 @@ void initializeSDCard() {
 }
 
 void remountSDCard() {
-  if (sdTestRunning) {
-    Serial.println(F("[SD] Remount rejected: SD diagnostic test is running."));
+  if (sdOperationActive || sdTestRunning) {
+    Serial.println(F("[SD] Cannot remount while another SD operation is active."));
     return;
   }
 
@@ -1416,6 +1897,10 @@ void refreshSDInformation() {
 // -----------------------------------------------------------------------------
 
 bool runSDTest() {
+  if (sdOperationActive) {
+    Serial.println(F("[SD TEST] Cannot run while another SD operation is active."));
+    return false;
+  }
   if (!sdReady) {
     sdTestPassed = false;
     sdLastResult = "SD card is not mounted";
@@ -1437,10 +1922,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V04 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V05 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V04 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V05 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -1592,6 +2077,10 @@ void configureWebServer() {
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
   server.on("/api/faults", HTTP_GET, handleFaults);
+  server.on("/api/files", HTTP_GET, handleFileList);
+  server.on("/api/file", HTTP_GET, handleFileView);
+  server.on("/download", HTTP_GET, handleFileDownload);
+  server.on("/api/reset", HTTP_POST, handleResetRequest);
   server.on("/api/test", HTTP_GET, handleSDTest);
   server.on("/api/client-error", HTTP_POST, handleClientError);
   server.onNotFound(handleNotFound);
@@ -1778,7 +2267,7 @@ String getSystemHealth() {
   if (!preferencesReady || !diagnosticPreferencesReady || !faultBootIdPersistent ||
       !mdnsStarted || sdWriteFailures || sdReadFailures || sdMountFailures ||
       httpErrorResponses || httpClientErrorReports || getActiveFaultCount() ||
-      faultQueueDropCount || faultLogWriteFailures ||
+      faultQueueDropCount || faultLogWriteFailures || canRxQueueFullCount ||
       (configuredStaSsid.length() > 0 && !wifiStaConnected &&
        !wifiStaConnecting && !wifiStaManuallyDisconnected)) return "WARN";
   return "PASS";
@@ -1808,6 +2297,7 @@ String getSystemHealthDetails() {
   }
   if (faultQueueDropCount) details += "Fault-event queue drops=" + String(faultQueueDropCount) + "; ";
   if (faultLogWriteFailures) details += "Fault-file write failures=" + String(faultLogWriteFailures) + "; ";
+  if (canRxQueueFullCount) details += "TWAI RX queue-full events=" + String(canRxQueueFullCount) + "; ";
   if (details.length() == 0) return "No active health warnings.";
   details.remove(details.length() - 2);
   return details;
@@ -1934,7 +2424,23 @@ String makeStatusJson() {
   json += "\"faultLogReady\":" + String(faultLogReady ? "true" : "false") + ",";
   json += "\"faultLogWriteFailures\":" + String(faultLogWriteFailures) + ",";
   json += "\"ledState\":\"" + String(getLedPatternText()) + "\",";
-  json += "\"canInitialized\":false";
+  json += "\"canInitialized\":" + String(canInitialized ? "true" : "false") + ",";
+  json += "\"canState\":\"" + jsonEscape(canStateText) + "\",";
+  json += "\"canBitrate\":" + String(CAN_BITRATE) + ",";
+  json += "\"canRxPin\":" + String(CAN_RX_PIN) + ",";
+  json += "\"canTxPin\":" + String(CAN_TX_PIN) + ",";
+  json += "\"canInitAttempts\":" + String(canInitAttempts) + ",";
+  json += "\"canInitFailures\":" + String(canInitFailures) + ",";
+  json += "\"canBusOffCount\":" + String(canBusOffCount) + ",";
+  json += "\"canRecoveryCount\":" + String(canRecoveryCount) + ",";
+  json += "\"canRecoveryAttempts\":" + String(canRecoveryAttempts) + ",";
+  json += "\"canRxQueueFullCount\":" + String(canRxQueueFullCount) + ",";
+  json += "\"canFramesDiscarded\":" + String(canFramesDiscarded) + ",";
+  json += "\"canLastError\":" + String(canLastError) + ",";
+  json += "\"sdFileListRequests\":" + String(sdFileListRequests) + ",";
+  json += "\"sdFileReadRequests\":" + String(sdFileReadRequests) + ",";
+  json += "\"sdFileDownloadRequests\":" + String(sdFileDownloadRequests) + ",";
+  json += "\"sdFileOperationFailures\":" + String(sdFileOperationFailures);
   json += "}";
 
   return json;
@@ -2042,7 +2548,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V04</p>
+<p class="sub">System dashboard - V05</p>
 
 <div class="grid">
   <section class="card">
@@ -2146,7 +2652,13 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>Timing events captured</span><span class="value" id="loopTimingEvents">--</span></div>
     <div id="loopEvents" class="small muted">No loop timing history loaded.</div>
     <div class="row"><span>Diagnostic events retained</span><span class="value" id="eventCount">--</span></div>
-    <div class="row"><span>CAN</span><span class="value">Not initialized</span></div>
+    <div class="row"><span>Controller</span><span class="value" id="canState">--</span></div>
+    <div class="row"><span>Mode / bitrate</span><span class="value">Listen-only / 250 kbit/s</span></div>
+    <div class="row"><span>RX / TX pins</span><span class="value">GPIO26 / GPIO27</span></div>
+    <div class="row"><span>Init attempts / failures</span><span class="value" id="canInit">--</span></div>
+    <div class="row"><span>Bus-off / recoveries</span><span class="value" id="canRecovery">--</span></div>
+    <div class="row"><span>Frames discarded (V05)</span><span class="value" id="canDiscarded">--</span></div>
+    <div class="row"><span>RX queue full events</span><span class="value" id="canQueueFull">--</span></div>
   </section>
 </div>
 
@@ -2155,6 +2667,21 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <button onclick="runTest()">Run SD write/read test</button>
   <button class="secondary" onclick="refreshStatus()">Refresh status</button>
   <p id="message"></p>
+</section>
+
+<section class="card">
+  <h2>SD diagnostic files</h2>
+  <div class="row"><span>Directory</span><span class="value">/diag</span></div>
+  <button class="secondary" onclick="refreshFiles()">Refresh file list</button>
+  <div id="sdFiles" class="small muted">Loading SD files...</div>
+  <label for="fileContents">File preview</label>
+  <pre id="fileContents">Select a file to view its contents.</pre>
+</section>
+
+<section class="card">
+  <h2>System control</h2>
+  <button class="secondary" onclick="requestReset()">Restart device</button>
+  <p class="small muted">Performs a controlled software restart. The Wi-Fi access point and dashboard will be temporarily unavailable.</p>
 </section>
 
 <section class="card">
@@ -2169,7 +2696,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI is intentionally inactive in V04.</p>
+<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V05 discards received frames after draining the TWAI driver queue; V06 adds acquisition.</p>
 </main>
 
 <script>
@@ -2191,6 +2718,48 @@ async function fetchJson(url){
     if(!response.ok) throw new Error('HTTP '+response.status);
     return await response.json();
   }finally{clearTimeout(timeout);}
+}
+async function refreshFiles(){
+  const host=document.getElementById('sdFiles');
+  try{
+    const data=await fetchJson('/api/files?path=%2Fdiag');
+    host.replaceChildren();
+    if(!data.entries.length){host.textContent='No files found.';return;}
+    data.entries.forEach(entry=>{
+      const row=document.createElement('div');
+      row.className='row';
+      const name=document.createElement('span');
+      name.textContent=entry.name+(entry.directory?'/':'');
+      const actions=document.createElement('span');
+      actions.className='value';
+      if(!entry.directory){
+        const view=document.createElement('button');view.className='secondary';view.textContent='View';
+        view.onclick=()=>viewFile(entry.name);
+        const download=document.createElement('button');download.textContent='Download';
+        download.onclick=()=>{window.location.href='/download?path='+encodeURIComponent(entry.name.startsWith('/')?entry.name:'/diag/'+entry.name);};
+        actions.append(view,download);
+      }else{actions.textContent='Directory';}
+      row.append(name,actions);host.appendChild(row);
+    });
+  }catch(e){host.textContent='File listing failed: '+e.message;}
+}
+async function viewFile(name){
+  const path=name.startsWith('/')?name:'/diag/'+name;
+  const preview=document.getElementById('fileContents');
+  preview.textContent='Loading '+path+'...';
+  try{
+    const response=await fetch('/api/file?path='+encodeURIComponent(path),{cache:'no-store'});
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    preview.textContent=await response.text();
+  }catch(e){preview.textContent='File view failed: '+e.message;}
+}
+async function requestReset(){
+  if(!confirm('Restart SD-CANbus-Logger now? The dashboard connection will be interrupted.')) return;
+  try{
+    const response=await fetch('/api/reset',{method:'POST'});
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    setText('message','Restart requested. Reconnect after the device boots.');
+  }catch(e){setText('message','Restart request failed: '+e.message);}
 }
 async function refreshStatus(){
   try{
@@ -2251,6 +2820,11 @@ async function refreshStatus(){
     setText('eventCount',s.eventCount);
     setText('faultActiveCount',s.faultActiveCount);
     setText('ledState',s.ledState);
+    setText('canState',s.canState);
+    setText('canInit',s.canInitAttempts+' / '+s.canInitFailures);
+    setText('canRecovery',s.canBusOffCount+' / '+s.canRecoveryCount);
+    setText('canDiscarded',s.canFramesDiscarded);
+    setText('canQueueFull',s.canRxQueueFullCount);
     setText('faultLogReady',s.faultLogReady?'READY':'NOT READY');
     setText('faultQueue',s.faultQueueCount+' / '+s.faultQueueDrops);
     setText('message','');
@@ -2323,6 +2897,7 @@ refreshFaults();
 refreshEvents();
 refreshHttpErrors();
 refreshLoopEvents();
+refreshFiles();
 setInterval(refreshStatus,5000);
 setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
@@ -2412,6 +2987,26 @@ void processSerialCommand(char *command) {
     runSDTest();
   } else if (!strcmp(command, "sd remount")) {
     remountSDCard();
+  } else if (!strcmp(command, "reset")) {
+    requestSoftwareReset("serial command");
+  } else if (!strncmp(command, "ls", 2) && (command[2] == '\0' || command[2] == ' ')) {
+    char *path = command + 2;
+    while (*path == ' ') path++;
+    printSDDirectory(*path ? path : "/diag");
+  } else if (!strncmp(command, "cat ", 4)) {
+    printSDFile(command + 4, "cat", 0);
+  } else if (!strncmp(command, "head ", 5)) {
+    char *path = command + 5;
+    char *space = strrchr(path, ' ');
+    uint16_t lines = 10;
+    if (space) { *space = '\0'; lines = (uint16_t)constrain(atoi(space + 1), 1, 200); }
+    printSDFile(path, "head", lines);
+  } else if (!strncmp(command, "tail ", 5)) {
+    char *path = command + 5;
+    char *space = strrchr(path, ' ');
+    uint16_t lines = 10;
+    if (space) { *space = '\0'; lines = (uint16_t)constrain(atoi(space + 1), 1, 50); }
+    printSDFile(path, "tail", lines);
   } else if (!strcmp(command, "wifi status")) {
     printWiFiStatus();
   } else if (!strcmp(command, "wifi disconnect")) {
@@ -2472,11 +3067,18 @@ void printHelp() {
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
   Serial.println(F("sd remount                    Unmount, remount, and verify the SD card"));
+  Serial.println(F("reset                        Controlled software restart"));
+  Serial.println(F("ls [path]                    List /diag files (default /diag)"));
+  Serial.println(F("cat <path>                   Display complete diagnostic file"));
+  Serial.println(F("head <path> [lines]          Display first N lines (default 10)"));
+  Serial.println(F("tail <path> [lines]          Display last N lines (default 10)"));
   Serial.println(F("wifi status                  Show AP and infrastructure status"));
   Serial.println(F("wifi connect SSID|PASSWORD  Save credentials and connect"));
   Serial.println(F("wifi disconnect              Disconnect; retain saved credentials"));
   Serial.println(F("wifi forget                  Erase saved infrastructure credentials"));
   Serial.println();
+  Serial.println(F("SD file inspection is read-only and restricted to /diag."));
+  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V05 does not log frames."));
   Serial.println(F("AP remains enabled as a recovery interface."));
   Serial.println(F("Wi-Fi password is never printed."));
   Serial.println();
@@ -2571,13 +3173,12 @@ void printStatus() {
     }
   }
   Serial.print(F("Fault event queue:    ")); Serial.print(faultQueueCount); Serial.print(F(" queued; ")); Serial.print(faultQueueDropCount); Serial.println(F(" dropped"));
- Serial.print(F("Fault file:           "));
-if (faultLogReady) {
-  Serial.println(FAULT_LOG_FILE);
-} else {
-  Serial.println(F("NOT READY"));
-}
+  Serial.print(F("Fault file:           "));
+  if (faultLogReady) Serial.println(FAULT_LOG_FILE);
+  else Serial.println(F("NOT READY"));
   Serial.print(F("Fault file writes:    ")); Serial.print(faultLogWriteCount); Serial.print(F(" pass; ")); Serial.println(faultLogWriteFailures);
+  Serial.print(F("File list/read/download requests: ")); Serial.print(sdFileListRequests); Serial.print(F(" / ")); Serial.print(sdFileReadRequests); Serial.print(F(" / ")); Serial.println(sdFileDownloadRequests);
+  Serial.print(F("File operation failures: ")); Serial.println(sdFileOperationFailures);
   if (faultHistoryCount) {
     uint8_t lastIndex = (faultHistoryHead + FAULT_HISTORY_SIZE - 1) % FAULT_HISTORY_SIZE;
     const FaultEventRecord &lastFaultEvent = faultEventHistory[lastIndex];
@@ -2589,6 +3190,16 @@ if (faultLogReady) {
     Serial.println(F("Last fault event:     None retained"));
   }
   Serial.print(F("Diagnostic LED:       ")); Serial.print(getLedPatternText()); Serial.print(F(" on GPIO")); Serial.println(RGB_LED_DATA_PIN);
-  Serial.println(F("CAN/TWAI:             NOT INITIALIZED"));
+  Serial.println(F("CAN / TWAI"));
+  Serial.println(F("----------"));
+  Serial.print(F("State:                ")); Serial.println(canStateText);
+  Serial.print(F("Mode / bitrate:       LISTEN-ONLY / ")); Serial.println(CAN_BITRATE);
+  Serial.print(F("RX / TX pins:         ")); Serial.print(CAN_RX_PIN); Serial.print(F(" / ")); Serial.println(CAN_TX_PIN);
+  Serial.print(F("Init attempts/fails:  ")); Serial.print(canInitAttempts); Serial.print(F(" / ")); Serial.println(canInitFailures);
+  Serial.print(F("Bus-off/recoveries:   ")); Serial.print(canBusOffCount); Serial.print(F(" / ")); Serial.println(canRecoveryCount);
+  Serial.print(F("Frames discarded:     ")); Serial.println(canFramesDiscarded);
+  Serial.print(F("RX queue full events:  ")); Serial.println(canRxQueueFullCount);
+  Serial.print(F("Recovery attempts:     ")); Serial.println(canRecoveryAttempts);
+  Serial.print(F("Last TWAI error:      0x")); Serial.println(canLastError, HEX);
   Serial.println();
 }
