@@ -44,7 +44,8 @@
     head <path> [lines]
     tail <path> [lines]
     wifi status
-    wifi connect SSID|PASSWORD
+    wifi connect [SSID|PASSWORD]
+    wifi scan
     wifi disconnect
     wifi forget
 
@@ -56,6 +57,8 @@
     Infrastructure credentials are entered over USB serial and saved in NVS.
 
   Credential command syntax:
+    wifi connect
+    Reconnect using the saved infrastructure credentials.
     wifi connect MyNetwork|MyPassword
     The pipe character separates SSID and password and cannot be part of either.
     SSID must be 1-32 characters; password must be 8-63 characters, or empty
@@ -278,6 +281,7 @@ bool wifiStaWasConnected = false;
 bool wifiStaConnecting = false;
 bool wifiStaManuallyDisconnected = false;
 bool mdnsStarted = false;
+bool wifiScanInProgress = false;
 
 bool sdReady = false;
 bool sdTestPassed = false;
@@ -402,6 +406,9 @@ void startStationConnection(const String &ssid, const String &password, bool sav
 void updateWiFiState();
 void startMDNSIfNeeded();
 void printWiFiStatus();
+void startWiFiScan();
+void serviceWiFiScan();
+void printWiFiScanResults(int16_t count);
 
 void initializeSDCard();
 void remountSDCard();
@@ -561,6 +568,7 @@ void loop() {
   server.handleClient();
   serviceSerial();
   updateWiFiState();
+  serviceWiFiScan();
   serviceCANReceiveQueue();
   updateCANState();
   startMDNSIfNeeded();
@@ -1749,6 +1757,79 @@ void startMDNSIfNeeded() {
     addEvent("WARN", "mDNS start failed; retry scheduled");
     Serial.println(F("[mDNS] Start failed; will retry."));
   }
+}
+
+void startWiFiScan() {
+  if (wifiScanInProgress) {
+    Serial.println(F("[Wi-Fi] A scan is already in progress."));
+    return;
+  }
+
+  Serial.println(F("[Wi-Fi] Starting asynchronous network scan..."));
+  Serial.println(F("[Wi-Fi] Scan is asynchronous; the main loop continues, though Wi-Fi response may briefly slow."));
+
+  int16_t result = WiFi.scanNetworks(true, true);
+  if (result == WIFI_SCAN_RUNNING) {
+    wifiScanInProgress = true;
+    return;
+  }
+
+  if (result == WIFI_SCAN_FAILED) {
+    Serial.println(F("[Wi-Fi] Scan could not be started."));
+    WiFi.scanDelete();
+    return;
+  }
+
+  printWiFiScanResults(result);
+  WiFi.scanDelete();
+}
+
+void serviceWiFiScan() {
+  if (!wifiScanInProgress) return;
+
+  int16_t result = WiFi.scanComplete();
+  if (result == WIFI_SCAN_RUNNING) return;
+
+  wifiScanInProgress = false;
+  if (result == WIFI_SCAN_FAILED) {
+    Serial.println(F("[Wi-Fi] Scan failed."));
+    WiFi.scanDelete();
+    return;
+  }
+
+  printWiFiScanResults(result);
+  WiFi.scanDelete();
+}
+
+void printWiFiScanResults(int16_t count) {
+  Serial.println();
+  Serial.println(F("WI-FI SCAN RESULTS"));
+  Serial.println(F("------------------"));
+
+  if (count <= 0) {
+    Serial.println(F("No networks found."));
+    Serial.println();
+    return;
+  }
+
+  Serial.print(F("Networks found: "));
+  Serial.println(count);
+  Serial.println(F("#  RSSI(dBm)  CH  SECURITY  SSID"));
+  Serial.println(F("-----------------------------------------------"));
+
+  for (int16_t i = 0; i < count; ++i) {
+    Serial.print(i + 1);
+    Serial.print(F("  "));
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(F("       "));
+    Serial.print(WiFi.channel(i));
+    Serial.print(F("   "));
+    Serial.print(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? F("OPEN") : F("SECURED"));
+    Serial.print(F("    "));
+    String ssid = WiFi.SSID(i);
+    Serial.println(ssid.length() ? ssid : String("<hidden SSID>"));
+  }
+  Serial.println();
 }
 
 void printWiFiStatus() {
@@ -3009,6 +3090,16 @@ void processSerialCommand(char *command) {
     printSDFile(path, "tail", lines);
   } else if (!strcmp(command, "wifi status")) {
     printWiFiStatus();
+  } else if (!strcmp(command, "wifi connect")) {
+    if (configuredStaSsid.length() == 0) {
+      Serial.println(F("[Wi-Fi] No saved infrastructure credentials. Use wifi connect SSID|PASSWORD first."));
+      return;
+    }
+    Serial.print(F("[Wi-Fi] Reconnecting using saved credentials for SSID: "));
+    Serial.println(configuredStaSsid);
+    startStationConnection(configuredStaSsid, configuredStaPassword, false);
+  } else if (!strcmp(command, "wifi scan")) {
+    startWiFiScan();
   } else if (!strcmp(command, "wifi disconnect")) {
     WiFi.disconnect(false, false);
     wifiStaManuallyDisconnected = true;
@@ -3073,7 +3164,9 @@ void printHelp() {
   Serial.println(F("head <path> [lines]          Display first N lines (default 10)"));
   Serial.println(F("tail <path> [lines]          Display last N lines (default 10)"));
   Serial.println(F("wifi status                  Show AP and infrastructure status"));
-  Serial.println(F("wifi connect SSID|PASSWORD  Save credentials and connect"));
+  Serial.println(F("wifi connect                  Reconnect using saved credentials"));
+  Serial.println(F("wifi connect SSID|PASSWORD   Save credentials and connect"));
+  Serial.println(F("wifi scan                     Scan nearby networks (asynchronous)"));
   Serial.println(F("wifi disconnect              Disconnect; retain saved credentials"));
   Serial.println(F("wifi forget                  Erase saved infrastructure credentials"));
   Serial.println();
