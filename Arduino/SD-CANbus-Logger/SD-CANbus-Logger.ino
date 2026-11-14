@@ -1,12 +1,12 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V06
+  Firmware: V07
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V06 purpose:
+  V07 purpose:
     - Preserve the V05 Wi-Fi, SD, HTTP, and diagnostic foundation.
     - Distinguish Wi-Fi CONNECTING from an actual disconnected fault.
     - Drive the onboard WS2812-compatible RGB LED on GPIO4 using the
@@ -71,6 +71,9 @@
     /                 Dashboard
     /api/status       System diagnostic snapshot
     /api/can-frames   Recent CAN frame history
+    /api/logging      CAN logging status
+    /api/logging/start Start a CAN capture
+    /api/logging/stop  Stop and finalize a CAN capture
     /api/events       Recent diagnostic events
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
@@ -87,7 +90,8 @@
     - Select the appropriate ESP32 Dev Module board definition.
     - CAN/TWAI starts at 250 kbit/s in listen-only mode. A dedicated task drains
       the driver RX queue and stores a bounded in-RAM frame history.
-    - V06 does not write CAN frames to SD; binary logging is a later milestone.
+    - V07 writes received CAN frames to versioned binary files using a bounded
+      FreeRTOS queue; the CAN receive task never performs SD operations.
     - GPIO4 drives the onboard WS2812-compatible addressable RGB LED.
 */
 
@@ -104,13 +108,15 @@
 #include <esp_timer.h>
 #include <esp32-hal-rgb-led.h>
 #include <driver/twai.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // -----------------------------------------------------------------------------
 // Firmware identity and project configuration
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V06";
+static const char FIRMWARE_VERSION[] = "V07";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -135,6 +141,9 @@ static const int CAN_TX_PIN = 27;
 static const uint32_t CAN_BITRATE = 250000;
 static const uint16_t CAN_RX_DRIVER_QUEUE_LENGTH = 64;
 static const uint8_t CAN_FRAME_HISTORY_SIZE = 32;
+static const uint16_t CAN_LOG_QUEUE_LENGTH = 512;
+static const uint8_t CAN_LOG_BATCH_RECORDS = 32;
+static const uint16_t CAN_LOG_FORMAT_VERSION = 1;
 static const uint16_t CAN_RX_TASK_STACK_BYTES = 4096;
 static const UBaseType_t CAN_RX_TASK_PRIORITY = 3;
 static const BaseType_t CAN_RX_TASK_CORE = 1;
@@ -196,6 +205,31 @@ struct CanFrameRecord {
   bool extended;
   bool remote;
 };
+
+// On-card binary format. All fields are written in the ESP32's little-endian
+// representation. Header and record sizes are fixed and versioned.
+#pragma pack(push, 1)
+struct CanLogFileHeader {
+  char magic[4];              // "SCNL"
+  uint16_t formatVersion;
+  uint16_t headerSize;
+  uint16_t recordSize;
+  uint16_t reserved;
+  uint32_t bitrate;
+  uint32_t bootId;
+  uint64_t startTimestampUs;
+  uint32_t reserved2;
+};
+struct CanLogRecord {
+  uint64_t timestampUs;
+  uint32_t identifier;
+  uint8_t flags;              // bit 0 extended, bit 1 remote
+  uint8_t dlc;
+  uint8_t data[8];
+};
+#pragma pack(pop)
+static_assert(sizeof(CanLogFileHeader) == 32, "CAN log header size changed");
+static_assert(sizeof(CanLogRecord) == 22, "CAN log record size changed");
 
 // Fault IDs represent independent fault conditions. Several conditions can be
 // active simultaneously within the same subsystem.
@@ -313,15 +347,35 @@ uint32_t sdFileOperationFailures = 0;
 
 bool canDriverInstalled = false;
 bool canInitialized = false;
+QueueHandle_t canLogQueue = nullptr;
+File canLogFile;
+volatile bool canLoggingActive = false;
+uint32_t canLogEnqueueInFlight = 0; // Protected by canMux.
+bool canLoggingStopping = false;
+bool canLogFileOpen = false;
+char canLogCurrentPath[40] = "";
+uint32_t canLogFileSequence = 0;
+uint32_t canLogFilesCreated = 0;
+uint32_t canLogFramesQueued = 0;
+uint32_t canLogFramesWritten = 0;
+uint32_t canLogQueueDrops = 0;
+uint32_t canLogWriteFailures = 0;
+uint32_t canLogWriteOperations = 0;
+uint32_t canLogLastWriteMs = 0;
+uint32_t canLogMaxWriteMs = 0;
+uint32_t canLogLastBatchRecords = 0;
+uint32_t canLogQueueHighWater = 0;
+uint32_t canLogStartTimestampUs = 0;
+uint32_t canLogLastFlushMs = 0;
 bool canRecoveryRequested = false;
 bool canRxTaskStarted = false;
 bool canRxTaskRunning = false;
-bool canBusOffLatched = false;
 TaskHandle_t canRxTaskHandle = nullptr;
 String canStateText = "NOT INITIALIZED";
 uint32_t canInitAttempts = 0;
 uint32_t canInitFailures = 0;
 uint32_t canBusOffCount = 0;
+bool canBusOffLatched = false;
 uint32_t canRecoveryCount = 0;
 uint32_t canRecoveryAttempts = 0;
 uint32_t canRxQueueFullCount = 0;
@@ -394,6 +448,8 @@ uint32_t httpLastDurationUs = 0;
 uint32_t httpMaxDurationUs = 0;
 char httpLastRoute[80] = "none";
 uint16_t httpLastStatusCode = 0;
+char httpMaxRoute[80] = "none";
+uint16_t httpMaxStatusCode = 0;
 
 uint32_t loopCount = 0;
 uint32_t loopLastDurationUs = 0;
@@ -464,6 +520,14 @@ void handleResetRequest();
 void requestSoftwareReset(const char *source);
 void flushPendingFaultEvents(uint32_t timeoutMs);
 void initializeCANController();
+void serviceCANLogger();
+bool startCANLogging();
+bool stopCANLogging(bool reportResult = true);
+void printCANLoggingStatus();
+String makeCANLoggingJson();
+void handleCANLoggingStatus();
+void handleCANLoggingStart();
+void handleCANLoggingStop();
 void updateCANState();
 void canReceiveTask(void *parameter);
 void printCANFrames(uint8_t requestedCount);
@@ -616,7 +680,8 @@ void loop() {
   serviceWiFiScan();
   updateCANState();
   startMDNSIfNeeded();
-  serviceFaultLog();
+  serviceFaultLog();  // Diagnostic fault records retain priority over bulk CAN capture writes.
+  serviceCANLogger();
   updateLed();
 
   delay(2);
@@ -1068,6 +1133,7 @@ bool isTextDiagnosticFile(const String &path) {
 }
 
 void printSDDirectory(const char *path) {
+  if (canLoggingActive || canLoggingStopping) { Serial.println(F("[SD] File inspection paused while CAN capture is active.")); return; }
   if (!sdReady || sdOperationActive) {
     Serial.println(F("[SD] Unavailable or busy."));
     return;
@@ -1109,6 +1175,7 @@ void printSDDirectory(const char *path) {
 }
 
 void printSDFile(const char *path, const char *mode, uint16_t lineCount) {
+  if (canLoggingActive || canLoggingStopping) { Serial.println(F("[SD] File inspection paused while CAN capture is active.")); return; }
   if (!sdReady || sdOperationActive) {
     Serial.println(F("[SD] Unavailable or busy."));
     return;
@@ -1188,6 +1255,7 @@ void printSDFile(const char *path, const char *mode, uint16_t lineCount) {
 
 void handleFileList() {
   uint32_t started = micros();
+  if (canLoggingActive || canLoggingStopping) { sendHttpResponse(503, "application/json", "{\"error\":\"CAN capture active; file inspection paused\"}"); recordHttp("GET", "/api/files", started, 503); return; }
   String path = server.hasArg("path") ? server.arg("path") : "/diag";
   if (!sdReady || !isAllowedSDPath(path, true)) {
     sendHttpResponse(sdReady ? 400 : 503, "application/json", "{\"error\":\"SD unavailable or path rejected\"}");
@@ -1233,6 +1301,7 @@ void handleFileList() {
 
 void handleFileView() {
   uint32_t started = micros();
+  if (canLoggingActive || canLoggingStopping) { sendHttpResponse(503, "text/plain", "CAN capture active; file inspection paused"); recordHttp("GET", "/api/file", started, 503); return; }
   String path = server.arg("path");
   if (!sdReady || !isAllowedSDPath(path, false) || !isTextDiagnosticFile(path) || sdOperationActive) {
     int code = !sdReady ? 503 : (sdOperationActive ? 503 : 400);
@@ -1266,6 +1335,7 @@ void handleFileView() {
 
 void handleFileDownload() {
   uint32_t started = micros();
+  if (canLoggingActive || canLoggingStopping) { sendHttpResponse(503, "text/plain", "CAN capture active; file inspection paused"); recordHttp("GET", "/download", started, 503); return; }
   String path = server.arg("path");
   if (!sdReady || !isAllowedSDPath(path, false) || sdOperationActive) {
     int code = !sdReady ? 503 : (sdOperationActive ? 503 : 400);
@@ -1377,6 +1447,12 @@ void initializeCANController() {
   }
 
   canInitialized = true;
+  canLogQueue = xQueueCreate(CAN_LOG_QUEUE_LENGTH, sizeof(CanLogRecord));
+  if (!canLogQueue) {
+    Serial.println(F("[CAN LOG] ERROR: could not allocate bounded logging queue; CAN reception will continue without SD logging."));
+    addEvent("ERROR", "CAN logging queue allocation failed");
+  }
+
   BaseType_t taskResult = xTaskCreatePinnedToCore(
       canReceiveTask, "can_rx", CAN_RX_TASK_STACK_BYTES, nullptr,
       CAN_RX_TASK_PRIORITY, &canRxTaskHandle, CAN_RX_TASK_CORE);
@@ -1440,7 +1516,28 @@ void canReceiveTask(void *parameter) {
       canFrameHistory[canFrameHistoryHead] = record;
       canFrameHistoryHead = (canFrameHistoryHead + 1) % CAN_FRAME_HISTORY_SIZE;
       canLastFrameTimestampUs = record.timestampUs;
+      bool loggingSnapshot = canLoggingActive;
+      if (loggingSnapshot) canLogEnqueueInFlight++;
       portEXIT_CRITICAL(&canMux);
+
+      if (loggingSnapshot && canLogQueue) {
+        CanLogRecord diskRecord = {};
+        diskRecord.timestampUs = record.timestampUs;
+        diskRecord.identifier = record.identifier;
+        diskRecord.flags = (record.extended ? 0x01 : 0) | (record.remote ? 0x02 : 0);
+        diskRecord.dlc = record.dataLengthCode;
+        memcpy(diskRecord.data, record.data, sizeof(diskRecord.data));
+        if (xQueueSend(canLogQueue, &diskRecord, 0) == pdTRUE) {
+          canLogFramesQueued++;
+          UBaseType_t waiting = uxQueueMessagesWaiting(canLogQueue);
+          if (waiting > canLogQueueHighWater) canLogQueueHighWater = waiting;
+        } else {
+          canLogQueueDrops++;
+        }
+        portENTER_CRITICAL(&canMux);
+        if (canLogEnqueueInFlight > 0) canLogEnqueueInFlight--;
+        portEXIT_CRITICAL(&canMux);
+      }
 
       // Under a continuously busy bus, periodically let the lower-priority
       // Arduino loop task run for one tick (HTTP, Wi-Fi, diagnostics).
@@ -1457,6 +1554,199 @@ void canReceiveTask(void *parameter) {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
   }
+}
+
+// -----------------------------------------------------------------------------
+// CAN binary logger. Only the Arduino loop task accesses the SD file. The
+// high-priority CAN task copies records into a bounded FreeRTOS queue and never
+// waits for SD I/O. A full queue causes an explicitly counted logging drop.
+// -----------------------------------------------------------------------------
+
+bool startCANLogging() {
+  if (!sdReady) { Serial.println(F("[CAN LOG] SD card is not mounted.")); return false; }
+  if (canLoggingActive || canLogFileOpen) { Serial.println(F("[CAN LOG] Capture already active.")); return false; }
+  if (!canLogQueue) { Serial.println(F("[CAN LOG] Logging queue unavailable.")); return false; }
+  if (sdOperationActive) { Serial.println(F("[CAN LOG] SD is busy; try again.")); return false; }
+
+  xQueueReset(canLogQueue); // discard any stale records from a prior stopped/failed session
+  char path[40];
+  bool found = false;
+  for (uint32_t i = 1; i <= 99999; ++i) {
+    snprintf(path, sizeof(path), "/diag/CAN_%05lu.BIN", (unsigned long)i);
+    if (!SD.exists(path)) { canLogFileSequence = i; found = true; break; }
+  }
+  if (!found) { Serial.println(F("[CAN LOG] No unused capture filename available.")); return false; }
+
+  sdOperationActive = true;
+  canLogFile = SD.open(path, FILE_WRITE);
+  if (!canLogFile) {
+    sdOperationActive = false;
+    canLogWriteFailures++;
+    addEvent("ERROR", "Could not create CAN capture file");
+    Serial.println(F("[CAN LOG] File creation failed."));
+    return false;
+  }
+
+  CanLogFileHeader header = {};
+  memcpy(header.magic, "SCNL", 4);
+  header.formatVersion = CAN_LOG_FORMAT_VERSION;
+  header.headerSize = sizeof(CanLogFileHeader);
+  header.recordSize = sizeof(CanLogRecord);
+  header.bitrate = CAN_BITRATE;
+  header.bootId = faultBootId;
+  header.startTimestampUs = (uint64_t)esp_timer_get_time();
+  size_t written = canLogFile.write((const uint8_t *)&header, sizeof(header));
+  canLogFile.flush();
+  if (written != sizeof(header)) {
+    canLogFile.close();
+    sdOperationActive = false;
+    canLogWriteFailures++;
+    addEvent("ERROR", "CAN capture header write failed");
+    Serial.println(F("[CAN LOG] Header write failed."));
+    return false;
+  }
+  snprintf(canLogCurrentPath, sizeof(canLogCurrentPath), "%s", path);
+  canLogFileOpen = true;
+  canLoggingStopping = false;
+  canLogFramesQueued = 0;
+  canLogFramesWritten = 0;
+  canLogQueueDrops = 0;
+  canLogWriteFailures = 0;
+  canLogWriteOperations = 0;
+  canLogLastWriteMs = 0;
+  canLogMaxWriteMs = 0;
+  canLogLastBatchRecords = 0;
+  canLogQueueHighWater = 0;
+  canLogStartTimestampUs = (uint32_t)header.startTimestampUs;
+  canLogLastFlushMs = millis();
+  portENTER_CRITICAL(&canMux);
+  canLoggingActive = true;
+  portEXIT_CRITICAL(&canMux);
+  canLogFilesCreated++;
+  sdOperationActive = false;
+  addEvent("INFO", "CAN binary capture started");
+  Serial.print(F("[CAN LOG] Capture started: ")); Serial.println(canLogCurrentPath);
+  return true;
+}
+
+void serviceCANLogger() {
+  if (!canLogFileOpen || !canLogQueue || sdOperationActive) return;
+  CanLogRecord batch[CAN_LOG_BATCH_RECORDS];
+  uint8_t count = 0;
+  while (count < CAN_LOG_BATCH_RECORDS && xQueueReceive(canLogQueue, &batch[count], 0) == pdTRUE) count++;
+  if (count == 0) {
+    if (canLoggingStopping && uxQueueMessagesWaiting(canLogQueue) == 0) stopCANLogging(true);
+    return;
+  }
+  sdOperationActive = true;
+  uint32_t started = millis();
+  size_t bytesExpected = (size_t)count * sizeof(CanLogRecord);
+  size_t bytesWritten = canLogFile.write((const uint8_t *)batch, bytesExpected);
+  canLogFile.flush();
+  canLogLastWriteMs = millis() - started;
+  if (canLogLastWriteMs > canLogMaxWriteMs) canLogMaxWriteMs = canLogLastWriteMs;
+  canLogWriteOperations++;
+  canLogLastBatchRecords = count;
+  if (bytesWritten == bytesExpected) {
+    canLogFramesWritten += count;
+  } else {
+    canLogWriteFailures++;
+    canLogQueueDrops += count;
+    addEvent("ERROR", "CAN capture write failed; capture stopped to prevent silent corruption");
+    portENTER_CRITICAL(&canMux);
+    canLoggingActive = false;
+    portEXIT_CRITICAL(&canMux);
+    uint32_t waitStarted = millis();
+    for (;;) {
+      uint32_t inFlight;
+      portENTER_CRITICAL(&canMux); inFlight = canLogEnqueueInFlight; portEXIT_CRITICAL(&canMux);
+      if (inFlight == 0 || millis() - waitStarted >= 50) break;
+      vTaskDelay(1);
+    }
+    canLogQueueDrops += uxQueueMessagesWaiting(canLogQueue);
+    xQueueReset(canLogQueue);
+    canLoggingStopping = true;
+  }
+  sdOperationActive = false;
+  if (canLoggingStopping && uxQueueMessagesWaiting(canLogQueue) == 0) stopCANLogging(true);
+}
+
+bool stopCANLogging(bool reportResult) {
+  if (!canLogFileOpen) {
+    if (reportResult) Serial.println(F("[CAN LOG] No capture file is open."));
+    return false;
+  }
+  portENTER_CRITICAL(&canMux);
+  canLoggingActive = false;
+  portEXIT_CRITICAL(&canMux);
+  // Wait for any receive-task iteration that observed the previous active
+  // state to finish its non-blocking queue send. No new enqueue can begin once
+  // canLoggingActive has been cleared under the same critical section.
+  uint32_t waitStarted = millis();
+  for (;;) {
+    uint32_t inFlight;
+    portENTER_CRITICAL(&canMux);
+    inFlight = canLogEnqueueInFlight;
+    portEXIT_CRITICAL(&canMux);
+    if (inFlight == 0 || millis() - waitStarted >= 50) break;
+    vTaskDelay(1);
+  }
+  if (canLogQueue && uxQueueMessagesWaiting(canLogQueue) > 0) {
+    canLoggingStopping = true;
+    if (reportResult) Serial.println(F("[CAN LOG] Stop requested; draining queued records."));
+    return true;
+  }
+  if (sdOperationActive) { canLoggingStopping = true; return true; }
+  sdOperationActive = true;
+  canLogFile.flush();
+  canLogFile.close();
+  canLogFileOpen = false;
+  canLoggingStopping = false;
+  sdOperationActive = false;
+  addEvent("INFO", "CAN binary capture stopped and file closed");
+  if (reportResult) {
+    Serial.print(F("[CAN LOG] Capture finalized: ")); Serial.println(canLogCurrentPath);
+    printCANLoggingStatus();
+  }
+  return true;
+}
+
+void printCANLoggingStatus() {
+  Serial.println(); Serial.println(F("CAN BINARY LOGGING")); Serial.println(F("------------------"));
+  Serial.print(F("State:                ")); Serial.println(canLoggingActive ? F("RECORDING") : (canLoggingStopping ? F("STOPPING / DRAINING") : F("STOPPED")));
+  Serial.print(F("File:                 ")); Serial.println(canLogCurrentPath[0] ? canLogCurrentPath : "None");
+  Serial.print(F("Format version:       ")); Serial.println(CAN_LOG_FORMAT_VERSION);
+  Serial.print(F("Record size:          ")); Serial.print(sizeof(CanLogRecord)); Serial.println(F(" bytes"));
+  Serial.print(F("Frames queued:        ")); Serial.println(canLogFramesQueued);
+  Serial.print(F("Frames written:       ")); Serial.println(canLogFramesWritten);
+  Serial.print(F("Queue depth:          ")); Serial.println(canLogQueue ? uxQueueMessagesWaiting(canLogQueue) : 0);
+  Serial.print(F("Queue high-water:     ")); Serial.println(canLogQueueHighWater);
+  Serial.print(F("Queue/write drops:    ")); Serial.println(canLogQueueDrops);
+  Serial.print(F("Write failures:       ")); Serial.println(canLogWriteFailures);
+  Serial.print(F("Write operations:     ")); Serial.println(canLogWriteOperations);
+  Serial.print(F("Last/max write:       ")); Serial.print(canLogLastWriteMs); Serial.print(F(" / ")); Serial.print(canLogMaxWriteMs); Serial.println(F(" ms"));
+  Serial.print(F("Last batch:           ")); Serial.println(canLogLastBatchRecords);
+}
+
+String makeCANLoggingJson() {
+  String json = "{";
+  json += "\"active\":" + String(canLoggingActive ? "true" : "false") + ",";
+  json += "\"stopping\":" + String(canLoggingStopping ? "true" : "false") + ",";
+  json += "\"fileOpen\":" + String(canLogFileOpen ? "true" : "false") + ",";
+  json += "\"file\":\"" + jsonEscape(String(canLogCurrentPath)) + "\",";
+  json += "\"formatVersion\":" + String(CAN_LOG_FORMAT_VERSION) + ",";
+  json += "\"recordSize\":" + String(sizeof(CanLogRecord)) + ",";
+  json += "\"framesQueued\":" + String(canLogFramesQueued) + ",";
+  json += "\"framesWritten\":" + String(canLogFramesWritten) + ",";
+  json += "\"queueDepth\":" + String(canLogQueue ? uxQueueMessagesWaiting(canLogQueue) : 0) + ",";
+  json += "\"queueHighWater\":" + String(canLogQueueHighWater) + ",";
+  json += "\"queueDrops\":" + String(canLogQueueDrops) + ",";
+  json += "\"writeFailures\":" + String(canLogWriteFailures) + ",";
+  json += "\"writeOperations\":" + String(canLogWriteOperations) + ",";
+  json += "\"lastWriteMs\":" + String(canLogLastWriteMs) + ",";
+  json += "\"maxWriteMs\":" + String(canLogMaxWriteMs) + ",";
+  json += "\"lastBatchRecords\":" + String(canLogLastBatchRecords) + "}";
+  return json;
 }
 
 String makeCANFramesJson() {
@@ -2136,6 +2426,10 @@ void initializeSDCard() {
 }
 
 void remountSDCard() {
+  if (canLoggingActive || canLoggingStopping) {
+    Serial.println(F("[SD] Remount refused while CAN capture is active or draining."));
+    return;
+  }
   if (sdOperationActive || sdTestRunning) {
     Serial.println(F("[SD] Cannot remount while another SD operation is active."));
     return;
@@ -2191,6 +2485,10 @@ void refreshSDInformation() {
 // -----------------------------------------------------------------------------
 
 bool runSDTest() {
+  if (canLoggingActive || canLoggingStopping) {
+    Serial.println(F("[SD TEST] Refused while CAN capture is active or draining."));
+    return false;
+  }
   if (sdOperationActive) {
     Serial.println(F("[SD TEST] Cannot run while another SD operation is active."));
     return false;
@@ -2216,10 +2514,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V06 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V07 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V06 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V07 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -2368,6 +2666,9 @@ void configureWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/can-frames", HTTP_GET, handleCANFrames);
+  server.on("/api/logging", HTTP_GET, handleCANLoggingStatus);
+  server.on("/api/logging/start", HTTP_POST, handleCANLoggingStart);
+  server.on("/api/logging/stop", HTTP_POST, handleCANLoggingStop);
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
@@ -2392,10 +2693,13 @@ void recordHttp(const char *method, const char *route, uint32_t startUs, uint16_
 
   httpRequests++;
   httpLastDurationUs = duration;
-  if (duration > httpMaxDurationUs) httpMaxDurationUs = duration;
-
   snprintf(httpLastRoute, sizeof(httpLastRoute), "%s", route);
   httpLastStatusCode = statusCode;
+  if (duration > httpMaxDurationUs) {
+    httpMaxDurationUs = duration;
+    snprintf(httpMaxRoute, sizeof(httpMaxRoute), "%s", route);
+    httpMaxStatusCode = statusCode;
+  }
 
   if (statusCode >= 400) {
     httpErrorResponses++;
@@ -2416,7 +2720,7 @@ void handleStatus() {
   uint32_t startUs = micros();
   httpStatusRequests++;
 
-  refreshSDInformation();
+  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation();
   String json = makeStatusJson();
   sendHttpResponse(200, "application/json", json);
   recordHttp("GET", "/api/status", startUs, 200);
@@ -2427,6 +2731,26 @@ void handleCANFrames() {
   String json = makeCANFramesJson();
   sendHttpResponse(200, "application/json", json);
   recordHttp("GET", "/api/can-frames", startUs, 200);
+}
+
+void handleCANLoggingStatus() {
+  uint32_t started = micros();
+  sendHttpResponse(200, "application/json", makeCANLoggingJson());
+  recordHttp("GET", "/api/logging", started, 200);
+}
+
+void handleCANLoggingStart() {
+  uint32_t started = micros();
+  bool ok = startCANLogging();
+  sendHttpResponse(ok ? 200 : 409, "application/json", makeCANLoggingJson());
+  recordHttp("POST", "/api/logging/start", started, ok ? 200 : 409);
+}
+
+void handleCANLoggingStop() {
+  uint32_t started = micros();
+  bool ok = stopCANLogging(false);
+  sendHttpResponse(ok ? 200 : 409, "application/json", makeCANLoggingJson());
+  recordHttp("POST", "/api/logging/stop", started, ok ? 200 : 409);
 }
 
 void handleEvents() {
@@ -2601,6 +2925,8 @@ String getSystemHealthDetails() {
   }
   if (faultQueueDropCount) details += "Fault-event queue drops=" + String(faultQueueDropCount) + "; ";
   if (faultLogWriteFailures) details += "Fault-file write failures=" + String(faultLogWriteFailures) + "; ";
+  if (canLogQueueDrops) details += "CAN capture queue/write drops=" + String(canLogQueueDrops) + "; ";
+  if (canLogWriteFailures) details += "CAN capture write failures=" + String(canLogWriteFailures) + "; ";
   if (canRxQueueFullCount) details += "TWAI RX queue-full alerts=" + String(canRxQueueFullCount) + "; ";
   if (canDriverRxMissedCount) details += "TWAI driver missed frames=" + String(canDriverRxMissedCount) + "; ";
   if (canDriverRxOverrunCount) details += "TWAI driver RX overruns=" + String(canDriverRxOverrunCount) + "; ";
@@ -2745,6 +3071,8 @@ String makeStatusJson() {
   json += "\"httpLastStatusCode\":" + String(httpLastStatusCode) + ",";
   json += "\"httpLastDurationUs\":" + String(httpLastDurationUs) + ",";
   json += "\"httpMaxDurationUs\":" + String(httpMaxDurationUs) + ",";
+  json += "\"httpMaxRoute\":\"" + String(httpMaxRoute) + "\",";
+  json += "\"httpMaxStatusCode\":" + String(httpMaxStatusCode) + ",";
   json += "\"httpErrorHistoryCount\":" + String(httpErrorCount) + ",";
 
   json += "\"loopCount\":" + String(loopCount) + ",";
@@ -2793,6 +3121,9 @@ String makeStatusJson() {
   json += "\"canDriverTxFailedCount\":" + String(canTxFailedSnapshot) + ",";
   json += "\"canLastFrameTimestampUs\":" + String((unsigned long long)canLastFrameTimestampSnapshot) + ",";
   json += "\"canLastError\":" + String(canLastErrorSnapshot) + ",";
+  json += "\"canLogActive\":" + String(canLoggingActive ? "true" : "false") + ",";
+  json += "\"canLogFramesWritten\":" + String(canLogFramesWritten) + ",";
+  json += "\"canLogQueueDrops\":" + String(canLogQueueDrops) + ",";
   json += "\"sdFileListRequests\":" + String(sdFileListRequests) + ",";
   json += "\"sdFileReadRequests\":" + String(sdFileReadRequests) + ",";
   json += "\"sdFileDownloadRequests\":" + String(sdFileDownloadRequests) + ",";
@@ -2904,7 +3235,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V06</p>
+<p class="sub">System dashboard - V07</p>
 
 <div class="grid">
   <section class="card">
@@ -2996,7 +3327,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>Browser-reported fetch errors</span><span class="value" id="httpClientErrorReports">--</span></div>
     <div class="row"><span>HTTP error responses</span><span class="value" id="httpErrorResponses">--</span></div>
     <div class="row"><span>Last route / status</span><span class="value" id="httpLastRoute">--</span></div>
-    <div class="row"><span>Last / max handler time</span><span class="value" id="httpTiming">--</span></div>
+    <div class="row"><span>Last handler time / route</span><span class="value" id="httpTiming">--</span></div>
+    <div class="row"><span>Maximum handler time / route</span><span class="value" id="httpMaxTiming">--</span></div>
     <div id="httpErrors" class="small muted">No HTTP error history loaded.</div>
   </section>
 
@@ -3025,6 +3357,20 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>Receive API errors</span><span class="value" id="canReceiveErrors">--</span></div>
   </section>
 </div>
+
+<section class="card">
+  <h2>CAN capture</h2>
+  <div class="row"><span>Capture state</span><span class="value" id="logState">--</span></div>
+  <div class="row"><span>Current file</span><span class="value" id="logFile">--</span></div>
+  <div class="row"><span>Frames queued / written</span><span class="value" id="logFrames">--</span></div>
+  <div class="row"><span>Queue depth / high-water</span><span class="value" id="logQueue">--</span></div>
+  <div class="row"><span>Dropped / write failures</span><span class="value" id="logDrops">--</span></div>
+  <div class="row"><span>Last / max write</span><span class="value" id="logTiming">--</span></div>
+  <button onclick="startCapture()">Start new capture</button>
+  <button class="secondary" onclick="stopCapture()">Stop capture</button>
+  <button class="secondary" onclick="refreshLogging()">Refresh capture status</button>
+  <p class="small muted">Binary format V1. Files are stored in /diag as CAN_XXXXX.BIN. Download for offline decoding; browser preview is not applicable.</p>
+</section>
 
 <section class="card">
   <h2>Recent CAN frames</h2>
@@ -3065,11 +3411,17 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V06 receives frames in a dedicated task and retains the latest 32 in RAM; CAN frames are not yet written to SD.</p>
+<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V07 receives frames in a dedicated task and writes versioned binary captures to /diag using a bounded queue.</p>
 </main>
 
 <script>
+let captureAccessPaused=false;
 function setText(id,value){document.getElementById(id).textContent=value;}
+function showCaptureFilePause(){
+  const host=document.getElementById('sdFiles');
+  host.textContent='SD file browsing and downloads are paused while CAN capture is active. Stop capture to access files.';
+  document.getElementById('fileContents').textContent='File preview is unavailable during CAN capture.';
+}
 function mb(v){return Number(v).toFixed(1)+' MB';}
 function kb(v){return (Number(v)/1024).toFixed(1)+' KB';}
 function reportBrowserError(endpoint,error){
@@ -3090,6 +3442,7 @@ async function fetchJson(url){
 }
 async function refreshFiles(){
   const host=document.getElementById('sdFiles');
+  if(captureAccessPaused){showCaptureFilePause();return;}
   try{
     const data=await fetchJson('/api/files?path=%2Fdiag');
     host.replaceChildren();
@@ -3102,17 +3455,23 @@ async function refreshFiles(){
       const actions=document.createElement('span');
       actions.className='value';
       if(!entry.directory){
-        const view=document.createElement('button');view.className='secondary';view.textContent='View';
-        view.onclick=()=>viewFile(entry.name);
+        const isBinary=entry.name.toLowerCase().endsWith('.bin');
+        if(!isBinary){
+          const view=document.createElement('button');view.className='secondary';view.textContent='View';
+          view.onclick=()=>viewFile(entry.name);
+          actions.append(view);
+        }
         const download=document.createElement('button');download.textContent='Download';
-        download.onclick=()=>{window.location.href='/download?path='+encodeURIComponent(entry.name.startsWith('/')?entry.name:'/diag/'+entry.name);};
-        actions.append(view,download);
+        download.onclick=()=>{if(captureAccessPaused){setText('message','Stop CAN capture before downloading SD files.');return;}window.location.href='/download?path='+encodeURIComponent(entry.name.startsWith('/')?entry.name:'/diag/'+entry.name);};
+        actions.append(download);
       }else{actions.textContent='Directory';}
       row.append(name,actions);host.appendChild(row);
     });
   }catch(e){host.textContent='File listing failed: '+e.message;}
 }
 async function viewFile(name){
+  if(captureAccessPaused){setText('fileContents','File preview is unavailable during CAN capture.');return;}
+  if(name.toLowerCase().endsWith('.bin')){setText('fileContents','Binary CAN captures cannot be displayed as text. Download the file and convert it to ASC using the supplied converter.');return;}
   const path=name.startsWith('/')?name:'/diag/'+name;
   const preview=document.getElementById('fileContents');
   preview.textContent='Loading '+path+'...';
@@ -3130,6 +3489,31 @@ async function requestReset(){
     setText('message','Restart requested. Reconnect after the device boots.');
   }catch(e){setText('message','Restart request failed: '+e.message);}
 }
+async function refreshLogging(){
+  try{const s=await fetchJson('/api/logging');
+    const wasPaused=captureAccessPaused;
+    captureAccessPaused=!!(s.active||s.stopping);
+    if(captureAccessPaused) showCaptureFilePause();
+    else if(wasPaused) refreshFiles();
+    setText('logState',s.active?'RECORDING':(s.stopping?'STOPPING / DRAINING':'STOPPED'));
+    setText('logFile',s.file||'None');
+    setText('logFrames',s.framesQueued+' / '+s.framesWritten);
+    setText('logQueue',s.queueDepth+' / '+s.queueHighWater);
+    setText('logDrops',s.queueDrops+' / '+s.writeFailures);
+    setText('logTiming',s.lastWriteMs+' / '+s.maxWriteMs+' ms');
+  }catch(e){setText('logState','Unavailable: '+e.message);}
+}
+async function startCapture(){
+  if(!confirm('Start a new CAN capture file on the SD card?'))return;
+  try{const r=await fetch('/api/logging/start',{method:'POST'});const s=await r.json();if(!r.ok)throw new Error('HTTP '+r.status);captureAccessPaused=true;showCaptureFilePause();setText('message','Capture started: '+s.file);refreshLogging();}
+  catch(e){setText('message','Start capture failed: '+e.message);}
+}
+async function stopCapture(){
+  if(!confirm('Stop CAN capture and finalize the file?'))return;
+  try{const r=await fetch('/api/logging/stop',{method:'POST'});const s=await r.json();if(!r.ok)throw new Error('HTTP '+r.status);captureAccessPaused=false;setText('message','Capture stopped and file finalized. Refreshing SD file list.');refreshLogging();refreshFiles();}
+  catch(e){setText('message','Stop capture failed: '+e.message);}
+}
+
 async function refreshCanFrames(){
   const host=document.getElementById('canFrames');
   try{
@@ -3196,7 +3580,8 @@ async function refreshStatus(){
     setText('httpClientErrorReports',s.httpClientErrorReports);
     setText('httpErrorResponses',s.httpErrorResponses);
     setText('httpLastRoute',s.httpLastRoute+' / '+s.httpLastStatusCode);
-    setText('httpTiming',s.httpLastDurationUs+' / '+s.httpMaxDurationUs+' us');
+    setText('httpTiming',s.httpLastDurationUs+' us - '+s.httpLastRoute+' / '+s.httpLastStatusCode);
+    setText('httpMaxTiming',s.httpMaxDurationUs+' us - '+s.httpMaxRoute+' / '+s.httpMaxStatusCode);
     setText('loopTimingEvents',s.loopTimingEventCount);
     setText('loopCount',s.loopCount);
     setText('loopDuration',s.loopLastDurationUs+' / '+s.loopMaxDurationUs+' us');
@@ -3291,12 +3676,14 @@ refreshHttpErrors();
 refreshLoopEvents();
 refreshCanFrames();
 refreshFiles();
+refreshLogging();
 setInterval(refreshStatus,5000);
 setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
 setInterval(refreshHttpErrors,15000);
 setInterval(refreshLoopEvents,15000);
 setInterval(refreshCanFrames,5000);
+setInterval(refreshLogging,5000);
 </script>
 </body>
 </html>
@@ -3377,6 +3764,12 @@ void processSerialCommand(char *command) {
     printLoopEvents();
   } else if (!strcmp(command, "checkpoints")) {
     printBootCheckpoints();
+  } else if (!strcmp(command, "log status")) {
+    printCANLoggingStatus();
+  } else if (!strcmp(command, "log start")) {
+    startCANLogging();
+  } else if (!strcmp(command, "log stop")) {
+    stopCANLogging(true);
   } else if (!strcmp(command, "can")) {
     printCANFrames(16);
   } else if (!strncmp(command, "can frames", 10) && (command[10] == '\0' || command[10] == ' ')) {
@@ -3478,6 +3871,9 @@ void printHelp() {
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
   Serial.println(F("can                          Show the 16 most recent CAN frames"));
   Serial.println(F("can frames [count]           Show 1-32 recent CAN frames"));
+  Serial.println(F("log start                    Start a new binary CAN capture"));
+  Serial.println(F("log stop                     Stop, drain, and close capture"));
+  Serial.println(F("log status                   Show CAN logging counters"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
   Serial.println(F("sd remount                    Unmount, remount, and verify the SD card"));
   Serial.println(F("reset                        Controlled software restart"));
@@ -3493,14 +3889,14 @@ void printHelp() {
   Serial.println(F("wifi forget                  Erase saved infrastructure credentials"));
   Serial.println();
   Serial.println(F("SD file inspection is read-only and restricted to /diag."));
-  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V06 retains recent frames in RAM, not SD."));
+  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V07 supports binary CAN capture to /diag."));
   Serial.println(F("AP remains enabled as a recovery interface."));
   Serial.println(F("Wi-Fi password is never printed."));
   Serial.println();
 }
 
 void printStatus() {
-  refreshSDInformation();
+  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation();
 
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -3566,7 +3962,8 @@ void printStatus() {
   Serial.print(F("404 requests:         ")); Serial.println(httpNotFoundRequests);
   Serial.print(F("Last route:           ")); Serial.println(httpLastRoute);
   Serial.print(F("Last status:          ")); Serial.println(httpLastStatusCode);
-  Serial.print(F("Last/max handler:     ")); Serial.print(httpLastDurationUs); Serial.print(F(" / ")); Serial.print(httpMaxDurationUs); Serial.println(F(" us"));
+  Serial.print(F("Last handler:         ")); Serial.print(httpLastDurationUs); Serial.print(F(" us - ")); Serial.print(httpLastRoute); Serial.print(F(" / ")); Serial.println(httpLastStatusCode);
+  Serial.print(F("Max handler:          ")); Serial.print(httpMaxDurationUs); Serial.print(F(" us - ")); Serial.print(httpMaxRoute); Serial.print(F(" / ")); Serial.println(httpMaxStatusCode);
   Serial.print(F("HTTP error history:   ")); Serial.print(httpErrorCount); Serial.print(F(" retained; ")); Serial.println(httpErrorResponses);
 
   Serial.println();
@@ -3656,5 +4053,6 @@ void printStatus() {
   Serial.print(F("Last frame timestamp: ")); Serial.print((unsigned long long)lastFrameTimestampSnapshot); Serial.println(F(" us since boot"));
   Serial.print(F("Recovery attempts:    ")); Serial.println(canRecoveryAttempts);
   Serial.print(F("Last TWAI error:      0x")); Serial.println(lastErrorSnapshot, HEX);
+  printCANLoggingStatus();
   Serial.println();
 }
