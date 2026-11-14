@@ -1,13 +1,13 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V05
+  Firmware: V06
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V05 purpose:
-    - Preserve the V03 Wi-Fi, SD, HTTP, and diagnostic foundation.
+  V06 purpose:
+    - Preserve the V05 Wi-Fi, SD, HTTP, and diagnostic foundation.
     - Distinguish Wi-Fi CONNECTING from an actual disconnected fault.
     - Drive the onboard WS2812-compatible RGB LED on GPIO4 using the
       Arduino-ESP32 RGB LED/RMT support.
@@ -15,6 +15,9 @@
     - Maintain bounded fault-event history and a bounded SD-write queue.
     - Append fault and recovery events to /diag/FAULTS.CSV.
     - Initialize native ESP32 TWAI at 250 kbit/s in listen-only mode.
+    - Receive CAN frames in a dedicated high-priority FreeRTOS task.
+    - Timestamp frames, count traffic, retain a bounded recent-frame history,
+      and expose TWAI queue/error instrumentation.
     - Provide controlled software reset and read-only SD file inspection.
 
   SD pin assignments:
@@ -67,6 +70,7 @@
   Browser endpoints:
     /                 Dashboard
     /api/status       System diagnostic snapshot
+    /api/can-frames   Recent CAN frame history
     /api/events       Recent diagnostic events
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
@@ -81,8 +85,9 @@
   Notes:
     - Remove the microSD card while flashing if required by the board.
     - Select the appropriate ESP32 Dev Module board definition.
-    - CAN/TWAI starts at 250 kbit/s in listen-only mode. The driver RX queue is
-      drained and frames discarded; V05 only drains/discards frames; V06 adds frame decoding, timestamps, and acquisition counters.
+    - CAN/TWAI starts at 250 kbit/s in listen-only mode. A dedicated task drains
+      the driver RX queue and stores a bounded in-RAM frame history.
+    - V06 does not write CAN frames to SD; binary logging is a later milestone.
     - GPIO4 drives the onboard WS2812-compatible addressable RGB LED.
 */
 
@@ -105,7 +110,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V05";
+static const char FIRMWARE_VERSION[] = "V06";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -128,6 +133,11 @@ static const int SD_MISO_PIN = 2;
 static const int CAN_RX_PIN = 26;
 static const int CAN_TX_PIN = 27;
 static const uint32_t CAN_BITRATE = 250000;
+static const uint16_t CAN_RX_DRIVER_QUEUE_LENGTH = 64;
+static const uint8_t CAN_FRAME_HISTORY_SIZE = 32;
+static const uint16_t CAN_RX_TASK_STACK_BYTES = 4096;
+static const UBaseType_t CAN_RX_TASK_PRIORITY = 3;
+static const BaseType_t CAN_RX_TASK_CORE = 1;
 
 // Onboard addressable RGB LED: GPIO4 is the WS2812 data input.
 static const int RGB_LED_DATA_PIN = 4;
@@ -176,6 +186,15 @@ struct LoopTimingRecord {
   uint32_t durationUs;
   uint16_t relatedHttpStatus;
   char relatedHttpRoute[48];
+};
+
+struct CanFrameRecord {
+  uint64_t timestampUs;       // esp_timer_get_time(): microseconds since boot.
+  uint32_t identifier;
+  uint8_t dataLengthCode;
+  uint8_t data[8];
+  bool extended;
+  bool remote;
 };
 
 // Fault IDs represent independent fault conditions. Several conditions can be
@@ -295,6 +314,10 @@ uint32_t sdFileOperationFailures = 0;
 bool canDriverInstalled = false;
 bool canInitialized = false;
 bool canRecoveryRequested = false;
+bool canRxTaskStarted = false;
+bool canRxTaskRunning = false;
+bool canBusOffLatched = false;
+TaskHandle_t canRxTaskHandle = nullptr;
 String canStateText = "NOT INITIALIZED";
 uint32_t canInitAttempts = 0;
 uint32_t canInitFailures = 0;
@@ -302,10 +325,28 @@ uint32_t canBusOffCount = 0;
 uint32_t canRecoveryCount = 0;
 uint32_t canRecoveryAttempts = 0;
 uint32_t canRxQueueFullCount = 0;
-bool canBusOffLatched = false;
+uint32_t canReceiveErrors = 0;
+uint32_t canFramesReceived = 0;
+uint32_t canStandardFrames = 0;
+uint32_t canExtendedFrames = 0;
+uint32_t canRemoteFrames = 0;
+uint32_t canHistoryOverwrites = 0;
+uint32_t canDriverRxQueueDepth = 0;
+uint32_t canDriverRxQueueMaxDepth = 0;
+uint32_t canDriverRxMissedCount = 0;
+uint32_t canDriverRxOverrunCount = 0;
+uint32_t canDriverRxErrorCounter = 0;
+uint32_t canDriverTxErrorCounter = 0;
+uint32_t canDriverBusErrorCount = 0;
+uint32_t canDriverArbitrationLostCount = 0;
+uint32_t canDriverTxFailedCount = 0;
+uint64_t canLastFrameTimestampUs = 0;
 uint32_t canLastError = 0;
-uint32_t canFramesDiscarded = 0;
 uint32_t canLastStatePollMs = 0;
+CanFrameRecord canFrameHistory[CAN_FRAME_HISTORY_SIZE];
+uint8_t canFrameHistoryHead = 0;
+uint8_t canFrameHistoryCount = 0;
+portMUX_TYPE canMux = portMUX_INITIALIZER_UNLOCKED;
 
 String configuredStaSsid;
 String configuredStaPassword;  // Never printed or returned by an endpoint.
@@ -424,7 +465,9 @@ void requestSoftwareReset(const char *source);
 void flushPendingFaultEvents(uint32_t timeoutMs);
 void initializeCANController();
 void updateCANState();
-void serviceCANReceiveQueue();
+void canReceiveTask(void *parameter);
+void printCANFrames(uint8_t requestedCount);
+String makeCANFramesJson();
 const char *getCANStateText();
 void refreshSDInformation();
 bool runSDTest();
@@ -432,6 +475,7 @@ bool runSDTest();
 void configureWebServer();
 void handleRoot();
 void handleStatus();
+void handleCANFrames();
 void handleEvents();
 void handleSDTest();
 void handleClientError();
@@ -440,6 +484,7 @@ void handleLoopEvents();
 void handleNotFound();
 
 String makeStatusJson();
+
 String makeEventsJson();
 String makeHttpErrorsJson();
 String makeLoopEventsJson();
@@ -569,7 +614,6 @@ void loop() {
   serviceSerial();
   updateWiFiState();
   serviceWiFiScan();
-  serviceCANReceiveQueue();
   updateCANState();
   startMDNSIfNeeded();
   serviceFaultLog();
@@ -1299,12 +1343,13 @@ void initializeCANController() {
 
   twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(
       (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
-  // A small driver queue is drained in the main loop. V05 discards frames at
-  // this boundary; V06 will add bounded application acquisition and logging.
-  general.rx_queue_len = 8;
+  // A 64-message driver queue provides burst tolerance. A dedicated task at
+  // priority 3 drains it independently of synchronous WebServer handlers.
+  general.rx_queue_len = CAN_RX_DRIVER_QUEUE_LENGTH;
   general.tx_queue_len = 0;
   general.alerts_enabled = TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_BUS_OFF |
-                           TWAI_ALERT_RECOVERY_IN_PROGRESS | TWAI_ALERT_BUS_RECOVERED;
+                           TWAI_ALERT_RECOVERY_IN_PROGRESS | TWAI_ALERT_BUS_RECOVERED |
+                           TWAI_ALERT_BUS_ERROR | TWAI_ALERT_ARB_LOST;
   twai_timing_config_t timing = TWAI_TIMING_CONFIG_250KBITS();
   twai_filter_config_t filter = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -1332,29 +1377,172 @@ void initializeCANController() {
   }
 
   canInitialized = true;
+  BaseType_t taskResult = xTaskCreatePinnedToCore(
+      canReceiveTask, "can_rx", CAN_RX_TASK_STACK_BYTES, nullptr,
+      CAN_RX_TASK_PRIORITY, &canRxTaskHandle, CAN_RX_TASK_CORE);
+  if (taskResult != pdPASS) {
+    canRxTaskStarted = false;
+    canStateText = "RX TASK FAILED";
+    setFault(FAULT_CAN_DRIVER, "CAN", 8,
+             "CAN receive task could not be created; frames are not being acquired");
+    Serial.println(F("[CAN] ERROR: receive task creation failed."));
+    return;
+  }
+
+  canRxTaskStarted = true;
   canStateText = "RUNNING - LISTEN ONLY";
-  clearFault(FAULT_CAN_DRIVER, "TWAI controller initialized successfully");
-  addEvent("INFO", "TWAI running at 250 kbit/s in listen-only mode");
+  clearFault(FAULT_CAN_DRIVER, "TWAI controller and receive task initialized successfully");
+  addEvent("INFO", "TWAI running at 250 kbit/s in listen-only mode; CAN receive task active");
   Serial.println(F("[CAN] TWAI initialized: 250 kbit/s, LISTEN-ONLY."));
   Serial.print(F("[CAN] RX GPIO")); Serial.print(CAN_RX_PIN);
   Serial.print(F("; TX GPIO")); Serial.println(CAN_TX_PIN);
+  Serial.print(F("[CAN] RX task: priority ")); Serial.print(CAN_RX_TASK_PRIORITY);
+  Serial.print(F(", core ")); Serial.print(CAN_RX_TASK_CORE);
+  Serial.print(F(", driver queue ")); Serial.println(CAN_RX_DRIVER_QUEUE_LENGTH);
 }
 
-void serviceCANReceiveQueue() {
-  if (!canDriverInstalled || !canInitialized) return;
-  twai_message_t discarded;
-  // Bounded drain: prevent the TWAI driver's small RX queue from filling while
-  // V05 intentionally has no frame acquisition pipeline.
-  for (uint8_t i = 0; i < 8; i++) {
-    if (twai_receive(&discarded, 0) != ESP_OK) break;
-    canFramesDiscarded++;
+// Runs independently of loop()/WebServer. The bounded ring is diagnostic
+// history only: overwriting an old history entry does not mean a CAN frame was
+// lost from acquisition. Driver-reported missed/overrun counters are separate.
+void canReceiveTask(void *parameter) {
+  (void)parameter;
+  portENTER_CRITICAL(&canMux);
+  canRxTaskRunning = true;
+  portEXIT_CRITICAL(&canMux);
+
+  uint8_t framesSinceYield = 0;
+  for (;;) {
+    twai_message_t message;
+    esp_err_t result = twai_receive(&message, pdMS_TO_TICKS(20));
+    if (result == ESP_OK) {
+      CanFrameRecord record = {};
+      record.timestampUs = (uint64_t)esp_timer_get_time();
+      record.identifier = message.identifier;
+      record.dataLengthCode = message.data_length_code > 8 ? 8 : message.data_length_code;
+      record.extended = message.extd;
+      record.remote = message.rtr;
+      if (!record.remote) {
+        for (uint8_t i = 0; i < record.dataLengthCode; i++) {
+          record.data[i] = message.data[i];
+        }
+      }
+
+      portENTER_CRITICAL(&canMux);
+      canFramesReceived++;
+      if (record.extended) canExtendedFrames++;
+      else canStandardFrames++;
+      if (record.remote) canRemoteFrames++;
+      if (canFrameHistoryCount == CAN_FRAME_HISTORY_SIZE) {
+        canHistoryOverwrites++;
+      } else {
+        canFrameHistoryCount++;
+      }
+      canFrameHistory[canFrameHistoryHead] = record;
+      canFrameHistoryHead = (canFrameHistoryHead + 1) % CAN_FRAME_HISTORY_SIZE;
+      canLastFrameTimestampUs = record.timestampUs;
+      portEXIT_CRITICAL(&canMux);
+
+      // Under a continuously busy bus, periodically let the lower-priority
+      // Arduino loop task run for one tick (HTTP, Wi-Fi, diagnostics).
+      framesSinceYield++;
+      if (framesSinceYield >= 16) {
+        framesSinceYield = 0;
+        vTaskDelay(1);
+      }
+    } else if (result != ESP_ERR_TIMEOUT) {
+      portENTER_CRITICAL(&canMux);
+      canReceiveErrors++;
+      canLastError = (uint32_t)result;
+      portEXIT_CRITICAL(&canMux);
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
   }
+}
+
+String makeCANFramesJson() {
+  CanFrameRecord snapshot[CAN_FRAME_HISTORY_SIZE];
+  uint8_t count = 0;
+
+  portENTER_CRITICAL(&canMux);
+  count = canFrameHistoryCount;
+  uint8_t first = (canFrameHistoryHead + CAN_FRAME_HISTORY_SIZE - count) % CAN_FRAME_HISTORY_SIZE;
+  for (uint8_t i = 0; i < count; i++) {
+    snapshot[i] = canFrameHistory[(first + i) % CAN_FRAME_HISTORY_SIZE];
+  }
+  portEXIT_CRITICAL(&canMux);
+
+  String json;
+  json.reserve(3000);
+  json = "{\"frames\":[";
+  for (uint8_t i = 0; i < count; i++) {
+    const CanFrameRecord &frame = snapshot[i];
+    if (i) json += ",";
+    json += "{\"timestampUs\":" + String((unsigned long long)frame.timestampUs);
+    json += ",\"id\":" + String(frame.identifier);
+    json += ",\"extended\":" + String(frame.extended ? "true" : "false");
+    json += ",\"remote\":" + String(frame.remote ? "true" : "false");
+    json += ",\"dlc\":" + String(frame.dataLengthCode);
+    json += ",\"data\":[";
+    for (uint8_t b = 0; b < frame.dataLengthCode && !frame.remote; b++) {
+      if (b) json += ",";
+      json += String(frame.data[b]);
+    }
+    json += "]}";
+  }
+  json += "]}";
+  return json;
+}
+
+void printCANFrames(uint8_t requestedCount) {
+  CanFrameRecord snapshot[CAN_FRAME_HISTORY_SIZE];
+  uint8_t count = 0;
+  uint8_t limit = constrain(requestedCount, 1, CAN_FRAME_HISTORY_SIZE);
+
+  portENTER_CRITICAL(&canMux);
+  uint8_t available = canFrameHistoryCount;
+  count = available < limit ? available : limit;
+  uint8_t firstAvailable = (canFrameHistoryHead + CAN_FRAME_HISTORY_SIZE - available) % CAN_FRAME_HISTORY_SIZE;
+  uint8_t first = (firstAvailable + available - count) % CAN_FRAME_HISTORY_SIZE;
+  for (uint8_t i = 0; i < count; i++) {
+    snapshot[i] = canFrameHistory[(first + i) % CAN_FRAME_HISTORY_SIZE];
+  }
+  portEXIT_CRITICAL(&canMux);
+
+  Serial.println();
+  Serial.println(F("RECENT CAN FRAMES (timestamps are microseconds since boot)"));
+  Serial.println(F("---------------------------------------------------------"));
+  if (!count) {
+    Serial.println(F("No CAN frames received."));
+    return;
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    const CanFrameRecord &frame = snapshot[i];
+    Serial.printf("%llu us  ID=0x%0*lX  %s  %s  DLC=%u  DATA=",
+                  (unsigned long long)frame.timestampUs,
+                  frame.extended ? 8 : 3,
+                  (unsigned long)frame.identifier,
+                  frame.extended ? "EXT" : "STD",
+                  frame.remote ? "RTR" : "DATA",
+                  frame.dataLengthCode);
+    if (frame.remote) {
+      Serial.print(F("<remote request>"));
+    } else {
+      for (uint8_t b = 0; b < frame.dataLengthCode; b++) {
+        if (b) Serial.print(' ');
+        if (frame.data[b] < 16) Serial.print('0');
+        Serial.print(frame.data[b], HEX);
+      }
+    }
+    Serial.println();
+  }
+  Serial.println();
 }
 
 void updateCANState() {
   if (!canDriverInstalled) return;
   if (millis() - canLastStatePollMs < 100) return;
   canLastStatePollMs = millis();
+
   twai_status_info_t info;
   esp_err_t result = twai_get_status_info(&info);
   if (result != ESP_OK) {
@@ -1367,21 +1555,46 @@ void updateCANState() {
     return;
   }
 
+  portENTER_CRITICAL(&canMux);
+  canDriverRxQueueDepth = info.msgs_to_rx;
+  if (canDriverRxQueueDepth > canDriverRxQueueMaxDepth) {
+    canDriverRxQueueMaxDepth = canDriverRxQueueDepth;
+  }
+  canDriverRxMissedCount = info.rx_missed_count;
+  canDriverRxOverrunCount = info.rx_overrun_count;
+  canDriverRxErrorCounter = info.rx_error_counter;
+  canDriverTxErrorCounter = info.tx_error_counter;
+  canDriverBusErrorCount = info.bus_error_count;
+  canDriverArbitrationLostCount = info.arb_lost_count;
+  canDriverTxFailedCount = info.tx_failed_count;
+  portEXIT_CRITICAL(&canMux);
+
   uint32_t alerts = 0;
-  if (twai_read_alerts(&alerts, 0) == ESP_OK && (alerts & TWAI_ALERT_RX_QUEUE_FULL)) {
-    canRxQueueFullCount++;
+  if (twai_read_alerts(&alerts, 0) == ESP_OK) {
+    if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
+      portENTER_CRITICAL(&canMux);
+      canRxQueueFullCount++;
+      portEXIT_CRITICAL(&canMux);
+    }
   }
 
   switch (info.state) {
     case TWAI_STATE_RUNNING:
       canInitialized = true;
-      canStateText = "RUNNING - LISTEN ONLY";
+      if (canRxTaskStarted) {
+        canStateText = "RUNNING - LISTEN ONLY";
+        if (isFaultActive(FAULT_CAN_DRIVER)) {
+          clearFault(FAULT_CAN_DRIVER, "TWAI controller returned to running state");
+        }
+      } else {
+        canStateText = "RX TASK FAILED";
+        if (!isFaultActive(FAULT_CAN_DRIVER)) {
+          setFault(FAULT_CAN_DRIVER, "CAN", 8, "CAN receive task is not running");
+        }
+      }
       if (canRecoveryRequested) canRecoveryCount++;
       canRecoveryRequested = false;
       canBusOffLatched = false;
-      if (isFaultActive(FAULT_CAN_DRIVER)) {
-        clearFault(FAULT_CAN_DRIVER, "TWAI controller returned to running state");
-      }
       break;
     case TWAI_STATE_BUS_OFF:
       canInitialized = false;
@@ -2003,10 +2216,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V05 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V06 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V05 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V06 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -2154,6 +2367,7 @@ bool runSDTest() {
 void configureWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/can-frames", HTTP_GET, handleCANFrames);
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
@@ -2206,6 +2420,13 @@ void handleStatus() {
   String json = makeStatusJson();
   sendHttpResponse(200, "application/json", json);
   recordHttp("GET", "/api/status", startUs, 200);
+}
+
+void handleCANFrames() {
+  uint32_t startUs = micros();
+  String json = makeCANFramesJson();
+  sendHttpResponse(200, "application/json", json);
+  recordHttp("GET", "/api/can-frames", startUs, 200);
 }
 
 void handleEvents() {
@@ -2349,6 +2570,8 @@ String getSystemHealth() {
       !mdnsStarted || sdWriteFailures || sdReadFailures || sdMountFailures ||
       httpErrorResponses || httpClientErrorReports || getActiveFaultCount() ||
       faultQueueDropCount || faultLogWriteFailures || canRxQueueFullCount ||
+      canDriverRxMissedCount || canDriverRxOverrunCount ||
+      (canDriverInstalled && !canRxTaskStarted) ||
       (configuredStaSsid.length() > 0 && !wifiStaConnected &&
        !wifiStaConnecting && !wifiStaManuallyDisconnected)) return "WARN";
   return "PASS";
@@ -2378,7 +2601,10 @@ String getSystemHealthDetails() {
   }
   if (faultQueueDropCount) details += "Fault-event queue drops=" + String(faultQueueDropCount) + "; ";
   if (faultLogWriteFailures) details += "Fault-file write failures=" + String(faultLogWriteFailures) + "; ";
-  if (canRxQueueFullCount) details += "TWAI RX queue-full events=" + String(canRxQueueFullCount) + "; ";
+  if (canRxQueueFullCount) details += "TWAI RX queue-full alerts=" + String(canRxQueueFullCount) + "; ";
+  if (canDriverRxMissedCount) details += "TWAI driver missed frames=" + String(canDriverRxMissedCount) + "; ";
+  if (canDriverRxOverrunCount) details += "TWAI driver RX overruns=" + String(canDriverRxOverrunCount) + "; ";
+  if (canDriverInstalled && !canRxTaskStarted) details += "CAN receive task is not running; ";
   if (details.length() == 0) return "No active health warnings.";
   details.remove(details.length() - 2);
   return details;
@@ -2395,8 +2621,39 @@ String makeStatusJson() {
   uint32_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   float fragmentation = freeHeap ? 100.0f * (1.0f - ((float)largestBlock / (float)freeHeap)) : 0.0f;
 
+  uint32_t canFramesReceivedSnapshot, canStandardFramesSnapshot, canExtendedFramesSnapshot;
+  uint32_t canRemoteFramesSnapshot, canHistoryOverwritesSnapshot, canRxQueueFullSnapshot;
+  uint32_t canReceiveErrorsSnapshot, canQueueDepthSnapshot, canQueueMaxDepthSnapshot;
+  uint32_t canRxMissedSnapshot, canRxOverrunSnapshot, canRxErrorSnapshot, canTxErrorSnapshot;
+  uint32_t canBusErrorsSnapshot, canArbLostSnapshot, canTxFailedSnapshot;
+  uint32_t canHistoryCountSnapshot, canLastErrorSnapshot;
+  uint64_t canLastFrameTimestampSnapshot;
+  bool canRxTaskRunningSnapshot;
+  portENTER_CRITICAL(&canMux);
+  canFramesReceivedSnapshot = canFramesReceived;
+  canStandardFramesSnapshot = canStandardFrames;
+  canExtendedFramesSnapshot = canExtendedFrames;
+  canRemoteFramesSnapshot = canRemoteFrames;
+  canHistoryOverwritesSnapshot = canHistoryOverwrites;
+  canRxQueueFullSnapshot = canRxQueueFullCount;
+  canReceiveErrorsSnapshot = canReceiveErrors;
+  canQueueDepthSnapshot = canDriverRxQueueDepth;
+  canQueueMaxDepthSnapshot = canDriverRxQueueMaxDepth;
+  canRxMissedSnapshot = canDriverRxMissedCount;
+  canRxOverrunSnapshot = canDriverRxOverrunCount;
+  canRxErrorSnapshot = canDriverRxErrorCounter;
+  canTxErrorSnapshot = canDriverTxErrorCounter;
+  canBusErrorsSnapshot = canDriverBusErrorCount;
+  canArbLostSnapshot = canDriverArbitrationLostCount;
+  canTxFailedSnapshot = canDriverTxFailedCount;
+  canLastFrameTimestampSnapshot = canLastFrameTimestampUs;
+  canHistoryCountSnapshot = canFrameHistoryCount;
+  canLastErrorSnapshot = canLastError;
+  canRxTaskRunningSnapshot = canRxTaskRunning;
+  portEXIT_CRITICAL(&canMux);
+
   String json;
-  json.reserve(3600);
+  json.reserve(4400);
 
   json += "{";
   json += "\"project\":\"" + String(PROJECT_NAME) + "\",";
@@ -2515,9 +2772,27 @@ String makeStatusJson() {
   json += "\"canBusOffCount\":" + String(canBusOffCount) + ",";
   json += "\"canRecoveryCount\":" + String(canRecoveryCount) + ",";
   json += "\"canRecoveryAttempts\":" + String(canRecoveryAttempts) + ",";
-  json += "\"canRxQueueFullCount\":" + String(canRxQueueFullCount) + ",";
-  json += "\"canFramesDiscarded\":" + String(canFramesDiscarded) + ",";
-  json += "\"canLastError\":" + String(canLastError) + ",";
+  json += "\"canRxTaskStarted\":" + String(canRxTaskStarted ? "true" : "false") + ",";
+  json += "\"canRxTaskRunning\":" + String(canRxTaskRunningSnapshot ? "true" : "false") + ",";
+  json += "\"canFramesReceived\":" + String(canFramesReceivedSnapshot) + ",";
+  json += "\"canStandardFrames\":" + String(canStandardFramesSnapshot) + ",";
+  json += "\"canExtendedFrames\":" + String(canExtendedFramesSnapshot) + ",";
+  json += "\"canRemoteFrames\":" + String(canRemoteFramesSnapshot) + ",";
+  json += "\"canHistoryCount\":" + String(canHistoryCountSnapshot) + ",";
+  json += "\"canHistoryOverwrites\":" + String(canHistoryOverwritesSnapshot) + ",";
+  json += "\"canRxQueueFullCount\":" + String(canRxQueueFullSnapshot) + ",";
+  json += "\"canReceiveErrors\":" + String(canReceiveErrorsSnapshot) + ",";
+  json += "\"canDriverRxQueueDepth\":" + String(canQueueDepthSnapshot) + ",";
+  json += "\"canDriverRxQueueMaxDepth\":" + String(canQueueMaxDepthSnapshot) + ",";
+  json += "\"canDriverRxMissedCount\":" + String(canRxMissedSnapshot) + ",";
+  json += "\"canDriverRxOverrunCount\":" + String(canRxOverrunSnapshot) + ",";
+  json += "\"canDriverRxErrorCounter\":" + String(canRxErrorSnapshot) + ",";
+  json += "\"canDriverTxErrorCounter\":" + String(canTxErrorSnapshot) + ",";
+  json += "\"canDriverBusErrorCount\":" + String(canBusErrorsSnapshot) + ",";
+  json += "\"canDriverArbitrationLostCount\":" + String(canArbLostSnapshot) + ",";
+  json += "\"canDriverTxFailedCount\":" + String(canTxFailedSnapshot) + ",";
+  json += "\"canLastFrameTimestampUs\":" + String((unsigned long long)canLastFrameTimestampSnapshot) + ",";
+  json += "\"canLastError\":" + String(canLastErrorSnapshot) + ",";
   json += "\"sdFileListRequests\":" + String(sdFileListRequests) + ",";
   json += "\"sdFileReadRequests\":" + String(sdFileReadRequests) + ",";
   json += "\"sdFileDownloadRequests\":" + String(sdFileDownloadRequests) + ",";
@@ -2629,7 +2904,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V05</p>
+<p class="sub">System dashboard - V06</p>
 
 <div class="grid">
   <section class="card">
@@ -2734,14 +3009,27 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div id="loopEvents" class="small muted">No loop timing history loaded.</div>
     <div class="row"><span>Diagnostic events retained</span><span class="value" id="eventCount">--</span></div>
     <div class="row"><span>Controller</span><span class="value" id="canState">--</span></div>
+    <div class="row"><span>Receive task</span><span class="value" id="canRxTask">--</span></div>
     <div class="row"><span>Mode / bitrate</span><span class="value">Listen-only / 250 kbit/s</span></div>
     <div class="row"><span>RX / TX pins</span><span class="value">GPIO26 / GPIO27</span></div>
     <div class="row"><span>Init attempts / failures</span><span class="value" id="canInit">--</span></div>
     <div class="row"><span>Bus-off / recoveries</span><span class="value" id="canRecovery">--</span></div>
-    <div class="row"><span>Frames discarded (V05)</span><span class="value" id="canDiscarded">--</span></div>
-    <div class="row"><span>RX queue full events</span><span class="value" id="canQueueFull">--</span></div>
+    <div class="row"><span>Frames received</span><span class="value" id="canFramesReceived">--</span></div>
+    <div class="row"><span>Standard / extended / remote</span><span class="value" id="canFrameTypes">--</span></div>
+    <div class="row"><span>History retained / overwritten</span><span class="value" id="canHistory">--</span></div>
+    <div class="row"><span>Driver RX queue current / max</span><span class="value" id="canQueueDepth">--</span></div>
+    <div class="row"><span>RX queue full alerts</span><span class="value" id="canQueueFull">--</span></div>
+    <div class="row"><span>Driver missed / overrun</span><span class="value" id="canDriverLoss">--</span></div>
+    <div class="row"><span>RX / TX error counters</span><span class="value" id="canErrorCounters">--</span></div>
+    <div class="row"><span>Bus errors / arbitration lost</span><span class="value" id="canBusErrors">--</span></div>
+    <div class="row"><span>Receive API errors</span><span class="value" id="canReceiveErrors">--</span></div>
   </section>
 </div>
+
+<section class="card">
+  <h2>Recent CAN frames</h2>
+  <div id="canFrames" class="small muted">Waiting for CAN frame history...</div>
+</section>
 
 <section class="card">
   <h2>SD verification</h2>
@@ -2777,7 +3065,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V05 discards received frames after draining the TWAI driver queue; V06 adds acquisition.</p>
+<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V06 receives frames in a dedicated task and retains the latest 32 in RAM; CAN frames are not yet written to SD.</p>
 </main>
 
 <script>
@@ -2842,6 +3130,21 @@ async function requestReset(){
     setText('message','Restart requested. Reconnect after the device boots.');
   }catch(e){setText('message','Restart request failed: '+e.message);}
 }
+async function refreshCanFrames(){
+  const host=document.getElementById('canFrames');
+  try{
+    const result=await fetchJson('/api/can-frames');
+    if(!result.frames.length){host.textContent='No CAN frames received. Connect a CAN bus to exercise reception.';return;}
+    const lines=result.frames.slice().reverse().map(f=>{
+      const id='0x'+Number(f.id).toString(16).toUpperCase().padStart(f.extended?8:3,'0');
+      const data=f.remote?'RTR':f.data.map(b=>Number(b).toString(16).toUpperCase().padStart(2,'0')).join(' ');
+      return f.timestampUs+' us  '+id+'  '+(f.extended?'EXT':'STD')+'  DLC '+f.dlc+'  '+data;
+    });
+    host.textContent=lines.join('\n');
+    host.style.whiteSpace='pre-wrap';
+  }catch(e){host.textContent='CAN frame history unavailable: '+e.message;}
+}
+
 async function refreshStatus(){
   try{
     const s=await fetchJson('/api/status');
@@ -2904,8 +3207,16 @@ async function refreshStatus(){
     setText('canState',s.canState);
     setText('canInit',s.canInitAttempts+' / '+s.canInitFailures);
     setText('canRecovery',s.canBusOffCount+' / '+s.canRecoveryCount);
-    setText('canDiscarded',s.canFramesDiscarded);
+    setText('canRxTask',s.canRxTaskRunning?'RUNNING':(s.canRxTaskStarted?'STARTING':'NOT RUNNING'));
+    setText('canFramesReceived',s.canFramesReceived);
+    setText('canFrameTypes',s.canStandardFrames+' / '+s.canExtendedFrames+' / '+s.canRemoteFrames);
+    setText('canHistory',s.canHistoryCount+' / '+s.canHistoryOverwrites);
+    setText('canQueueDepth',s.canDriverRxQueueDepth+' / '+s.canDriverRxQueueMaxDepth);
     setText('canQueueFull',s.canRxQueueFullCount);
+    setText('canDriverLoss',s.canDriverRxMissedCount+' / '+s.canDriverRxOverrunCount);
+    setText('canErrorCounters',s.canDriverRxErrorCounter+' / '+s.canDriverTxErrorCounter);
+    setText('canBusErrors',s.canDriverBusErrorCount+' / '+s.canDriverArbitrationLostCount);
+    setText('canReceiveErrors',s.canReceiveErrors);
     setText('faultLogReady',s.faultLogReady?'READY':'NOT READY');
     setText('faultQueue',s.faultQueueCount+' / '+s.faultQueueDrops);
     setText('message','');
@@ -2978,12 +3289,14 @@ refreshFaults();
 refreshEvents();
 refreshHttpErrors();
 refreshLoopEvents();
+refreshCanFrames();
 refreshFiles();
 setInterval(refreshStatus,5000);
 setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
 setInterval(refreshHttpErrors,15000);
 setInterval(refreshLoopEvents,15000);
+setInterval(refreshCanFrames,5000);
 </script>
 </body>
 </html>
@@ -3064,6 +3377,13 @@ void processSerialCommand(char *command) {
     printLoopEvents();
   } else if (!strcmp(command, "checkpoints")) {
     printBootCheckpoints();
+  } else if (!strcmp(command, "can")) {
+    printCANFrames(16);
+  } else if (!strncmp(command, "can frames", 10) && (command[10] == '\0' || command[10] == ' ')) {
+    char *countText = command + 10;
+    while (*countText == ' ') countText++;
+    uint8_t count = *countText ? (uint8_t)constrain(atoi(countText), 1, CAN_FRAME_HISTORY_SIZE) : 16;
+    printCANFrames(count);
   } else if (!strcmp(command, "sdtest")) {
     runSDTest();
   } else if (!strcmp(command, "sd remount")) {
@@ -3156,6 +3476,8 @@ void printHelp() {
   Serial.println(F("httperrors                   Recent HTTP 4xx/5xx requests"));
   Serial.println(F("loopevents                   Recent loop timing anomalies (>=100 ms)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
+  Serial.println(F("can                          Show the 16 most recent CAN frames"));
+  Serial.println(F("can frames [count]           Show 1-32 recent CAN frames"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
   Serial.println(F("sd remount                    Unmount, remount, and verify the SD card"));
   Serial.println(F("reset                        Controlled software restart"));
@@ -3171,7 +3493,7 @@ void printHelp() {
   Serial.println(F("wifi forget                  Erase saved infrastructure credentials"));
   Serial.println();
   Serial.println(F("SD file inspection is read-only and restricted to /diag."));
-  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V05 does not log frames."));
+  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V06 retains recent frames in RAM, not SD."));
   Serial.println(F("AP remains enabled as a recovery interface."));
   Serial.println(F("Wi-Fi password is never printed."));
   Serial.println();
@@ -3289,10 +3611,50 @@ void printStatus() {
   Serial.print(F("Mode / bitrate:       LISTEN-ONLY / ")); Serial.println(CAN_BITRATE);
   Serial.print(F("RX / TX pins:         ")); Serial.print(CAN_RX_PIN); Serial.print(F(" / ")); Serial.println(CAN_TX_PIN);
   Serial.print(F("Init attempts/fails:  ")); Serial.print(canInitAttempts); Serial.print(F(" / ")); Serial.println(canInitFailures);
+  bool rxTaskRunningSnapshot;
+  uint32_t framesReceivedSnapshot, standardFramesSnapshot, extendedFramesSnapshot;
+  uint32_t remoteFramesSnapshot, historyCountSnapshot, historyOverwritesSnapshot;
+  uint32_t queueDepthSnapshot, queueMaxDepthSnapshot, queueFullSnapshot;
+  uint32_t missedSnapshot, overrunSnapshot, rxErrCounterSnapshot, txErrCounterSnapshot;
+  uint32_t busErrorSnapshot, arbLostSnapshot, txFailedSnapshot, receiveErrorsSnapshot, lastErrorSnapshot;
+  uint64_t lastFrameTimestampSnapshot;
+  portENTER_CRITICAL(&canMux);
+  rxTaskRunningSnapshot = canRxTaskRunning;
+  framesReceivedSnapshot = canFramesReceived;
+  standardFramesSnapshot = canStandardFrames;
+  extendedFramesSnapshot = canExtendedFrames;
+  remoteFramesSnapshot = canRemoteFrames;
+  historyCountSnapshot = canFrameHistoryCount;
+  historyOverwritesSnapshot = canHistoryOverwrites;
+  queueDepthSnapshot = canDriverRxQueueDepth;
+  queueMaxDepthSnapshot = canDriverRxQueueMaxDepth;
+  queueFullSnapshot = canRxQueueFullCount;
+  missedSnapshot = canDriverRxMissedCount;
+  overrunSnapshot = canDriverRxOverrunCount;
+  rxErrCounterSnapshot = canDriverRxErrorCounter;
+  txErrCounterSnapshot = canDriverTxErrorCounter;
+  busErrorSnapshot = canDriverBusErrorCount;
+  arbLostSnapshot = canDriverArbitrationLostCount;
+  txFailedSnapshot = canDriverTxFailedCount;
+  receiveErrorsSnapshot = canReceiveErrors;
+  lastFrameTimestampSnapshot = canLastFrameTimestampUs;
+  lastErrorSnapshot = canLastError;
+  portEXIT_CRITICAL(&canMux);
+  Serial.print(F("Receive task:         ")); Serial.println(rxTaskRunningSnapshot ? F("RUNNING") : (canRxTaskStarted ? F("STARTING") : F("NOT RUNNING")));
   Serial.print(F("Bus-off/recoveries:   ")); Serial.print(canBusOffCount); Serial.print(F(" / ")); Serial.println(canRecoveryCount);
-  Serial.print(F("Frames discarded:     ")); Serial.println(canFramesDiscarded);
-  Serial.print(F("RX queue full events:  ")); Serial.println(canRxQueueFullCount);
-  Serial.print(F("Recovery attempts:     ")); Serial.println(canRecoveryAttempts);
-  Serial.print(F("Last TWAI error:      0x")); Serial.println(canLastError, HEX);
+  Serial.print(F("Frames received:      ")); Serial.println(framesReceivedSnapshot);
+  Serial.print(F("Standard/extended:    ")); Serial.print(standardFramesSnapshot); Serial.print(F(" / ")); Serial.println(extendedFramesSnapshot);
+  Serial.print(F("Remote frames:        ")); Serial.println(remoteFramesSnapshot);
+  Serial.print(F("History retained:     ")); Serial.print(historyCountSnapshot); Serial.print(F(" / overwritten: ")); Serial.println(historyOverwritesSnapshot);
+  Serial.print(F("RX queue current/max: ")); Serial.print(queueDepthSnapshot); Serial.print(F(" / ")); Serial.println(queueMaxDepthSnapshot);
+  Serial.print(F("RX queue full alerts: ")); Serial.println(queueFullSnapshot);
+  Serial.print(F("Driver missed/overrun: ")); Serial.print(missedSnapshot); Serial.print(F(" / ")); Serial.println(overrunSnapshot);
+  Serial.print(F("RX/TX error counters: ")); Serial.print(rxErrCounterSnapshot); Serial.print(F(" / ")); Serial.println(txErrCounterSnapshot);
+  Serial.print(F("Bus errors/arb lost:  ")); Serial.print(busErrorSnapshot); Serial.print(F(" / ")); Serial.println(arbLostSnapshot);
+  Serial.print(F("TX failed count:      ")); Serial.println(txFailedSnapshot);
+  Serial.print(F("Receive API errors:   ")); Serial.println(receiveErrorsSnapshot);
+  Serial.print(F("Last frame timestamp: ")); Serial.print((unsigned long long)lastFrameTimestampSnapshot); Serial.println(F(" us since boot"));
+  Serial.print(F("Recovery attempts:    ")); Serial.println(canRecoveryAttempts);
+  Serial.print(F("Last TWAI error:      0x")); Serial.println(lastErrorSnapshot, HEX);
   Serial.println();
 }
