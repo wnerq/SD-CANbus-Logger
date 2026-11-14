@@ -1,18 +1,20 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V03
+  Firmware: V04
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V03 purpose:
-    - Preserve the V01 SD-card read/write verification.
-    - Add infrastructure Wi-Fi station connectivity while retaining the AP.
-    - Store infrastructure Wi-Fi credentials in ESP32 NVS (Preferences).
-    - Add shared diagnostics for Serial, browser status, and JSON endpoints.
-    - Add boot memory checkpoints, runtime/HTTP/SD metrics, and event history.
-    - Keep CAN/TWAI inactive; no CAN frames are transmitted or received.
+  V04 purpose:
+    - Preserve the V03 Wi-Fi, SD, HTTP, and diagnostic foundation.
+    - Distinguish Wi-Fi CONNECTING from an actual disconnected fault.
+    - Drive the onboard WS2812-compatible RGB LED on GPIO4 using the
+      Arduino-ESP32 RGB LED/RMT support.
+    - Provide a subtle 10-second healthy heartbeat and subsystem fault codes.
+    - Maintain bounded fault-event history and a bounded SD-write queue.
+    - Append fault and recovery events to /diag/FAULTS.CSV.
+    - Keep CAN/TWAI inactive; CAN fault states are reserved for later versions.
 
   SD pin assignments:
     CS   = GPIO13
@@ -28,8 +30,13 @@
     help
     status
     events
+    faults
+    faults clear
+    httperrors
+    loopevents
     checkpoints
     sdtest
+    sd remount
     wifi status
     wifi connect SSID|PASSWORD
     wifi disconnect
@@ -54,13 +61,15 @@
     /api/events       Recent diagnostic events
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
+    /api/faults       Active faults and recent fault/recovery events
     /api/test         Run SD write/append/readback verification
     /api/client-error Browser-side fetch error telemetry
 
   Notes:
     - Remove the microSD card while flashing if required by the board.
     - Select the appropriate ESP32 Dev Module board definition.
-    - CAN/TWAI is intentionally not initialized in V03.
+    - CAN/TWAI is intentionally not initialized in V04.
+    - GPIO4 drives the onboard WS2812-compatible addressable RGB LED.
 */
 
 #include <Arduino.h>
@@ -73,13 +82,15 @@
 #include <ESPmDNS.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <esp32-hal-rgb-led.h>
 
 // -----------------------------------------------------------------------------
 // Firmware identity and project configuration
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V03";
+static const char FIRMWARE_VERSION[] = "V04";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -99,12 +110,18 @@ static const int SD_SCK_PIN  = 14;
 static const int SD_MOSI_PIN = 15;
 static const int SD_MISO_PIN = 2;
 
-static const int CAN_RX_PIN = 26;  // Reserved; not initialized in V03.
-static const int CAN_TX_PIN = 27;  // Reserved; not initialized in V03.
+static const int CAN_RX_PIN = 26;  // Reserved; not initialized in V04.
+static const int CAN_TX_PIN = 27;  // Reserved; not initialized in V04.
+
+// Onboard addressable RGB LED: GPIO4 is the WS2812 data input.
+static const int RGB_LED_DATA_PIN = 4;
+static const uint32_t LED_HEARTBEAT_INTERVAL_MS = 10000;
+static const uint16_t LED_HEARTBEAT_PULSE_MS = 25;
 
 static const uint32_t SD_SPI_FREQUENCY = 4000000;
 static const char SD_TEST_DIRECTORY[] = "/diag";
 static const char SD_TEST_FILE[] = "/diag/SDTEST.TXT";
+static const char FAULT_LOG_FILE[] = "/diag/FAULTS.CSV";
 
 // -----------------------------------------------------------------------------
 // Diagnostic data model
@@ -145,6 +162,77 @@ struct LoopTimingRecord {
   char relatedHttpRoute[48];
 };
 
+// Fault IDs represent independent fault conditions. Several conditions can be
+// active simultaneously within the same subsystem.
+enum FaultId : uint8_t {
+  FAULT_WIFI_AP = 0,
+  FAULT_WIFI_STA,
+  FAULT_SD_MOUNT,
+  FAULT_SD_TEST,
+  FAULT_SD_LOG,
+  FAULT_CAN_DRIVER,
+  FAULT_ID_COUNT
+};
+
+struct ActiveFault {
+  bool active;
+  uint16_t code;
+  char subsystem[8];
+  char description[72];
+};
+
+struct FaultEventRecord {
+  uint64_t timestampUs;
+  uint32_t bootId;
+  uint32_t sequence;
+  uint16_t code;
+  char subsystem[8];
+  char event[20];
+  char description[72];
+};
+
+static const uint8_t FAULT_EVENT_QUEUE_SIZE = 16;
+static const uint8_t FAULT_HISTORY_SIZE = 16;
+static const uint32_t FAULT_LOG_RETRY_INTERVAL_MS = 10000;
+
+ActiveFault activeFaults[FAULT_ID_COUNT];
+FaultEventRecord faultEventQueue[FAULT_EVENT_QUEUE_SIZE];
+uint8_t faultQueueHead = 0;
+uint8_t faultQueueTail = 0;
+uint8_t faultQueueCount = 0;
+uint32_t faultQueueDropCount = 0;
+
+FaultEventRecord faultEventHistory[FAULT_HISTORY_SIZE];
+uint8_t faultHistoryHead = 0;
+uint8_t faultHistoryCount = 0;
+
+uint32_t faultBootId = 0;
+uint32_t faultEventSequence = 0;
+bool faultBootIdPersistent = false;
+bool faultLogReady = false;
+uint32_t faultLogWriteCount = 0;
+uint32_t faultLogWriteFailures = 0;
+uint32_t nextFaultLogRetryMs = 0;
+
+// LED patterns are advanced by updateLed() without delay().
+enum LedPattern : uint8_t {
+  LED_PATTERN_STARTUP = 0,
+  LED_PATTERN_IDLE,
+  LED_PATTERN_HEARTBEAT,
+  LED_PATTERN_TRANSITION,
+  LED_PATTERN_FAULT
+};
+
+LedPattern ledPattern = LED_PATTERN_STARTUP;
+bool ledInitialized = false;
+bool ledTransitionPending = false;
+uint8_t ledStartupStep = 0;
+uint8_t ledFaultSubsystem = 0;
+uint8_t ledFaultFlashesRemaining = 0;
+bool ledFaultGap = false;
+uint32_t ledNextActionMs = 0;
+uint32_t ledLastHeartbeatMs = 0;
+
 DiagnosticEvent eventHistory[EVENT_HISTORY_SIZE];
 uint8_t eventHead = 0;   // Next position to write.
 uint8_t eventCount = 0;
@@ -167,8 +255,10 @@ uint32_t loopTimingEventCount = 0;
 
 WebServer server(80);
 Preferences preferences;
+Preferences diagnosticPreferences;
 
 bool preferencesReady = false;
+bool diagnosticPreferencesReady = false;
 bool wifiApStarted = false;
 bool wifiStaConnected = false;
 bool wifiStaWasConnected = false;
@@ -251,6 +341,29 @@ void printLoopEvents();
 void addHttpError(const char *method, const char *uri, uint16_t statusCode);
 void addLoopTimingEvent();
 
+void initializeFaultSystem();
+void enqueueFaultEvent(const char *subsystem, const char *eventName,
+                       uint16_t code, const char *description);
+void setFault(FaultId id, const char *subsystem, uint16_t code, const char *description);
+void clearFault(FaultId id, const char *description);
+bool isFaultActive(FaultId id);
+bool isSubsystemFaultActive(const char *subsystem);
+uint8_t getActiveFaultCount();
+void serviceFaultLog();
+bool initializeFaultLogFile();
+bool writeFaultEvent(const FaultEventRecord &record);
+void printFaults();
+void handleFaults();
+
+void initializeLed();
+void updateLed();
+void setLedRed(uint8_t brightness);
+void requestLedTransition();
+const char *getLedPatternText();
+void startLedTransitionPattern();
+void startLedFaultPattern(uint8_t subsystemIndex);
+int findNextFaultSubsystem(int startIndex);
+
 void startWiFi();
 void startStationConnection(const String &ssid, const String &password, bool saveCredentials);
 void updateWiFiState();
@@ -258,6 +371,7 @@ void startMDNSIfNeeded();
 void printWiFiStatus();
 
 void initializeSDCard();
+void remountSDCard();
 void refreshSDInformation();
 bool runSDTest();
 
@@ -275,6 +389,7 @@ String makeStatusJson();
 String makeEventsJson();
 String makeHttpErrorsJson();
 String makeLoopEventsJson();
+String makeFaultsJson();
 String htmlPage();
 
 void serviceSerial();
@@ -299,9 +414,9 @@ void sendHttpResponse(int statusCode, const char *contentType, const String &bod
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
   bootMillis = millis();
+  initializeLed();
+  delay(500);
 
   Serial.println();
   Serial.println(F("================================================"));
@@ -316,6 +431,7 @@ void setup() {
   Serial.println(getResetReasonText());
   Serial.println();
 
+  initializeFaultSystem();
   addEvent("INFO", "System startup");
   captureBootCheckpoint("Startup");
 
@@ -355,6 +471,7 @@ WiFi.onEvent(
 
   startMDNSIfNeeded();
   captureBootCheckpoint("mDNS initialized");
+  serviceFaultLog();
 
   Serial.println();
   Serial.println(F("[HTTP] Dashboard and API are ready."));
@@ -395,6 +512,8 @@ void loop() {
   serviceSerial();
   updateWiFiState();
   startMDNSIfNeeded();
+  serviceFaultLog();
+  updateLed();
 
   delay(2);
 
@@ -541,6 +660,450 @@ void printBootCheckpoints() {
 }
 
 // -----------------------------------------------------------------------------
+// Fault-event infrastructure and persistent fault log
+// -----------------------------------------------------------------------------
+
+void initializeFaultSystem() {
+  diagnosticPreferencesReady = diagnosticPreferences.begin("diagcfg", false);
+  if (diagnosticPreferencesReady) {
+    uint32_t previousBootId = diagnosticPreferences.getUInt("bootId", 0);
+    faultBootId = previousBootId + 1;
+    if (faultBootId == 0) faultBootId = 1;
+    faultBootIdPersistent = diagnosticPreferences.putUInt("bootId", faultBootId) > 0;
+    diagnosticPreferences.end();
+  }
+
+  if (!faultBootIdPersistent) {
+    // A random session identifier still distinguishes this boot when NVS is
+    // unavailable, although it is not a persistent sequential boot counter.
+    faultBootId = esp_random();
+    if (faultBootId == 0) faultBootId = 1;
+    addEvent("WARN", "Persistent diagnostic boot ID unavailable; using random session ID");
+  }
+
+  enqueueFaultEvent("SYSTEM", "BOOT", 0, "Power-on startup");
+}
+
+void enqueueFaultEvent(const char *subsystem, const char *eventName,
+                       uint16_t code, const char *description) {
+  FaultEventRecord record;
+  memset(&record, 0, sizeof(record));
+  record.timestampUs = (uint64_t)esp_timer_get_time();
+  record.bootId = faultBootId;
+  record.sequence = ++faultEventSequence;
+  record.code = code;
+  snprintf(record.subsystem, sizeof(record.subsystem), "%s", subsystem);
+  snprintf(record.event, sizeof(record.event), "%s", eventName);
+  snprintf(record.description, sizeof(record.description), "%s", description);
+
+  faultEventHistory[faultHistoryHead] = record;
+  faultHistoryHead = (faultHistoryHead + 1) % FAULT_HISTORY_SIZE;
+  if (faultHistoryCount < FAULT_HISTORY_SIZE) faultHistoryCount++;
+
+  if (faultQueueCount >= FAULT_EVENT_QUEUE_SIZE) {
+    faultQueueDropCount++;
+    return;
+  }
+
+  faultEventQueue[faultQueueHead] = record;
+  faultQueueHead = (faultQueueHead + 1) % FAULT_EVENT_QUEUE_SIZE;
+  faultQueueCount++;
+}
+
+bool isFaultActive(FaultId id) {
+  return id < FAULT_ID_COUNT && activeFaults[id].active;
+}
+
+bool isSubsystemFaultActive(const char *subsystem) {
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (activeFaults[i].active && strcmp(activeFaults[i].subsystem, subsystem) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint8_t getActiveFaultCount() {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (activeFaults[i].active) count++;
+  }
+  return count;
+}
+
+void setFault(FaultId id, const char *subsystem, uint16_t code, const char *description) {
+  if (id >= FAULT_ID_COUNT) return;
+  ActiveFault &fault = activeFaults[id];
+  if (fault.active && fault.code == code &&
+      strncmp(fault.description, description, sizeof(fault.description)) == 0) return;
+
+  fault.active = true;
+  fault.code = code;
+  snprintf(fault.subsystem, sizeof(fault.subsystem), "%s", subsystem);
+  snprintf(fault.description, sizeof(fault.description), "%s", description);
+  enqueueFaultEvent(subsystem, "FAULT_ACTIVE", code, description);
+  addEvent("ERROR", description);
+}
+
+void clearFault(FaultId id, const char *description) {
+  if (id >= FAULT_ID_COUNT || !activeFaults[id].active) return;
+
+  ActiveFault &fault = activeFaults[id];
+  enqueueFaultEvent(fault.subsystem, "RECOVERED", fault.code, description);
+  addEvent("INFO", description);
+  fault.active = false;
+  fault.code = 0;
+  fault.description[0] = '\0';
+  ledTransitionPending = true;
+}
+
+bool writeCsvQuoted(File &file, const char *value) {
+  if (file.print('"') == 0) return false;
+  for (const char *p = value; *p; ++p) {
+    if (*p == '"' && file.print('"') == 0) return false;
+    if (file.write((uint8_t)*p) != 1) return false;
+  }
+  return file.print('"') > 0;
+}
+
+bool initializeFaultLogFile() {
+  if (!sdReady) return false;
+
+  if (!SD.exists(SD_TEST_DIRECTORY) && !SD.mkdir(SD_TEST_DIRECTORY)) return false;
+
+  File file = SD.open(FAULT_LOG_FILE, FILE_APPEND);
+  if (!file) return false;
+
+  bool ok = true;
+  if (file.size() == 0) {
+    const char header[] = "timestamp_us,boot_id,event_sequence,subsystem,event,code,description";
+    ok = file.println(header) == (strlen(header) + 2); // CRLF terminator
+    file.flush();
+  }
+  file.close();
+  return ok;
+}
+
+bool writeFaultEvent(const FaultEventRecord &record) {
+  File file = SD.open(FAULT_LOG_FILE, FILE_APPEND);
+  if (!file) return false;
+
+  char timestamp[24];
+  snprintf(timestamp, sizeof(timestamp), "%llu", (unsigned long long)record.timestampUs);
+
+  bool ok = file.print(timestamp) > 0;
+  ok = ok && file.print(',') > 0;
+  ok = ok && file.print(record.bootId) > 0;
+  ok = ok && file.print(',') > 0;
+  ok = ok && file.print(record.sequence) > 0;
+  ok = ok && file.print(',') > 0;
+  ok = ok && writeCsvQuoted(file, record.subsystem);
+  ok = ok && file.print(',') > 0;
+  ok = ok && writeCsvQuoted(file, record.event);
+  ok = ok && file.print(',') > 0;
+  ok = ok && file.print(record.code) > 0;
+  ok = ok && file.print(',') > 0;
+  ok = ok && writeCsvQuoted(file, record.description);
+  size_t newlineBytes = file.println();
+  ok = ok && newlineBytes > 0;
+  file.flush();
+  file.close();
+  return ok;
+}
+
+void serviceFaultLog() {
+  if (!sdReady) return;
+  uint32_t now = millis();
+  if (nextFaultLogRetryMs != 0 && (int32_t)(now - nextFaultLogRetryMs) < 0) return;
+
+  if (!faultLogReady) {
+    if (!initializeFaultLogFile()) {
+      faultLogWriteFailures++;
+      nextFaultLogRetryMs = now + FAULT_LOG_RETRY_INTERVAL_MS;
+      setFault(FAULT_SD_LOG, "SD", 3, "Fault history file could not be initialized or opened");
+      return;
+    }
+    faultLogReady = true;
+    nextFaultLogRetryMs = 0;
+  }
+
+  if (faultQueueCount == 0) return;
+
+  const FaultEventRecord &record = faultEventQueue[faultQueueTail];
+  if (writeFaultEvent(record)) {
+    faultQueueTail = (faultQueueTail + 1) % FAULT_EVENT_QUEUE_SIZE;
+    faultQueueCount--;
+    faultLogWriteCount++;
+    nextFaultLogRetryMs = 0;
+    if (isFaultActive(FAULT_SD_LOG) && sdTestPassed) {
+      clearFault(FAULT_SD_LOG, "SD fault-event file write recovered");
+    }
+  } else {
+    faultLogWriteFailures++;
+    faultLogReady = false;
+    nextFaultLogRetryMs = now + FAULT_LOG_RETRY_INTERVAL_MS;
+    setFault(FAULT_SD_LOG, "SD", 3, "Fault history file write failed");
+  }
+}
+
+void printFaults() {
+  Serial.println();
+  Serial.println(F("FAULT STATUS"));
+  Serial.println(F("------------"));
+  Serial.print(F("Boot/session ID:      ")); Serial.println(faultBootId);
+  Serial.print(F("Boot ID persistent:   ")); Serial.println(faultBootIdPersistent ? F("YES") : F("NO - RANDOM ID"));
+  Serial.print(F("Active faults:        ")); Serial.println(getActiveFaultCount());
+
+  bool anyActive = false;
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (!activeFaults[i].active) continue;
+    anyActive = true;
+    Serial.print(F("  ")); Serial.print(activeFaults[i].subsystem);
+    Serial.print(F(" code ")); Serial.print(activeFaults[i].code);
+    Serial.print(F(": ")); Serial.println(activeFaults[i].description);
+  }
+  if (!anyActive) Serial.println(F("  None"));
+
+Serial.print(F("Fault log:            "));
+if (faultLogReady) {
+  Serial.println(FAULT_LOG_FILE);
+} else {
+  Serial.println(F("NOT READY"));
+}
+
+  Serial.print(F("Queued events:        ")); Serial.println(faultQueueCount);
+  Serial.print(F("Queue drops:          ")); Serial.println(faultQueueDropCount);
+  Serial.print(F("Events written:       ")); Serial.println(faultLogWriteCount);
+  Serial.print(F("Write failures:       ")); Serial.println(faultLogWriteFailures);
+
+  Serial.println();
+  Serial.println(F("RECENT FAULT / RECOVERY EVENTS"));
+  Serial.println(F("------------------------------"));
+  if (!faultHistoryCount) {
+    Serial.println(F("No fault events retained."));
+  } else {
+    uint8_t first = (faultHistoryHead + FAULT_HISTORY_SIZE - faultHistoryCount) % FAULT_HISTORY_SIZE;
+    for (uint8_t i = 0; i < faultHistoryCount; i++) {
+      const FaultEventRecord &r = faultEventHistory[(first + i) % FAULT_HISTORY_SIZE];
+      char timestampText[24];
+      snprintf(timestampText, sizeof(timestampText), "%llu", (unsigned long long)r.timestampUs);
+      Serial.print(timestampText); Serial.print(F(" us  boot="));
+      Serial.print(r.bootId); Serial.print(F(" seq=")); Serial.print(r.sequence);
+      Serial.print(' '); Serial.print(r.subsystem); Serial.print(' ');
+      Serial.print(r.event); Serial.print(F(" code=")); Serial.print(r.code);
+      Serial.print(F("  ")); Serial.println(r.description);
+    }
+  }
+  Serial.println();
+}
+
+String makeFaultsJson() {
+  String json;
+  json.reserve(3000);
+  json = "{\"bootId\":" + String(faultBootId);
+  json += ",\"bootIdPersistent\":" + String(faultBootIdPersistent ? "true" : "false");
+  json += ",\"activeCount\":" + String(getActiveFaultCount());
+  json += ",\"queueCount\":" + String(faultQueueCount);
+  json += ",\"queueDrops\":" + String(faultQueueDropCount);
+  json += ",\"logReady\":" + String(faultLogReady ? "true" : "false");
+  json += ",\"logWrites\":" + String(faultLogWriteCount);
+  json += ",\"logWriteFailures\":" + String(faultLogWriteFailures);
+  json += ",\"ledState\":\"" + String(getLedPatternText()) + "\"";
+  json += ",\"active\":[";
+  bool firstActive = true;
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (!activeFaults[i].active) continue;
+    if (!firstActive) json += ',';
+    firstActive = false;
+    json += "{\"subsystem\":\"" + String(activeFaults[i].subsystem) + "\"";
+    json += ",\"code\":" + String(activeFaults[i].code);
+    json += ",\"description\":\"" + jsonEscape(String(activeFaults[i].description)) + "\"}";
+  }
+  json += "],\"events\":[";
+  uint8_t first = (faultHistoryHead + FAULT_HISTORY_SIZE - faultHistoryCount) % FAULT_HISTORY_SIZE;
+  for (uint8_t i = 0; i < faultHistoryCount; i++) {
+    const FaultEventRecord &r = faultEventHistory[(first + i) % FAULT_HISTORY_SIZE];
+    if (i) json += ',';
+    char timestampText[24];
+    snprintf(timestampText, sizeof(timestampText), "%llu", (unsigned long long)r.timestampUs);
+    json += "{\"timestampUs\":" + String(timestampText);
+    json += ",\"bootId\":" + String(r.bootId);
+    json += ",\"sequence\":" + String(r.sequence);
+    json += ",\"subsystem\":\"" + String(r.subsystem) + "\"";
+    json += ",\"event\":\"" + String(r.event) + "\"";
+    json += ",\"code\":" + String(r.code);
+    json += ",\"description\":\"" + jsonEscape(String(r.description)) + "\"}";
+  }
+  json += "]}";
+  return json;
+}
+
+void handleFaults() {
+  uint32_t startUs = micros();
+  String json = makeFaultsJson();
+  sendHttpResponse(200, "application/json", json);
+  recordHttp("GET", "/api/faults", startUs, 200);
+}
+
+// -----------------------------------------------------------------------------
+// Nonblocking WS2812 LED diagnostics
+// -----------------------------------------------------------------------------
+
+void setLedRed(uint8_t brightness) {
+  // Arduino-ESP32 3.3.x provides this RMT-backed WS2812 helper. Explicit GRB
+  // order matches the standard WS2812B data order.
+  // A one-pixel RMT frame is transmitted synchronously; the application
+  // pattern scheduler itself remains nonblocking and calls this only on edges.
+  rgbLedWriteOrdered(RGB_LED_DATA_PIN, LED_COLOR_ORDER_GRB, brightness, 0, 0);
+}
+
+void initializeLed() {
+  setLedRed(0);
+  ledInitialized = true;
+  ledPattern = LED_PATTERN_STARTUP;
+  ledStartupStep = 0;
+  ledNextActionMs = millis();
+  ledLastHeartbeatMs = millis();
+}
+
+void requestLedTransition() {
+  ledTransitionPending = true;
+}
+
+const char *getLedPatternText() {
+  if (!ledInitialized) return "NOT INITIALIZED";
+  switch (ledPattern) {
+    case LED_PATTERN_STARTUP: return "STARTUP";
+    case LED_PATTERN_HEARTBEAT: return "HEARTBEAT";
+    case LED_PATTERN_TRANSITION: return "TRANSITION";
+    case LED_PATTERN_FAULT: return "FAULT";
+    default: return getActiveFaultCount() ? "FAULT WAIT" : "HEALTHY IDLE";
+  }
+}
+
+int findNextFaultSubsystem(int startIndex) {
+  for (int offset = 0; offset < 3; offset++) {
+    int index = (startIndex + offset) % 3;
+    const char *name = index == 0 ? "WIFI" : (index == 1 ? "SD" : "CAN");
+    if (isSubsystemFaultActive(name)) return index;
+  }
+  return -1;
+}
+
+void startLedTransitionPattern() {
+  ledPattern = LED_PATTERN_TRANSITION;
+  setLedRed(12);
+  ledNextActionMs = millis() + 180;
+}
+
+void startLedFaultPattern(uint8_t subsystemIndex) {
+  ledPattern = LED_PATTERN_FAULT;
+  ledFaultSubsystem = subsystemIndex;
+  ledFaultFlashesRemaining = subsystemIndex + 1;
+  ledFaultGap = false;
+  setLedRed(32);
+  ledNextActionMs = millis() + 85;
+}
+
+void updateLed() {
+  if (!ledInitialized) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - ledNextActionMs) < 0) return;
+
+  // Startup is a distinct 1-long + 2-short red sequence.
+  if (ledPattern == LED_PATTERN_STARTUP) {
+    static const uint16_t durations[] = {130, 100, 65, 90, 65, 100};
+    if ((ledStartupStep % 2) == 0) setLedRed(20);
+    else setLedRed(0);
+    ledNextActionMs = now + durations[ledStartupStep];
+    ledStartupStep++;
+    if (ledStartupStep >= 6) {
+      setLedRed(0);
+      ledPattern = LED_PATTERN_IDLE;
+      ledLastHeartbeatMs = now;
+      ledNextActionMs = now;
+    }
+    return;
+  }
+
+  if (ledPattern == LED_PATTERN_HEARTBEAT) {
+    setLedRed(0);
+    ledPattern = LED_PATTERN_IDLE;
+    ledLastHeartbeatMs = now;
+    ledNextActionMs = now;
+    return;
+  }
+
+  if (ledPattern == LED_PATTERN_TRANSITION) {
+    setLedRed(0);
+    ledPattern = LED_PATTERN_IDLE;
+    ledTransitionPending = false;
+    ledLastHeartbeatMs = now;
+    ledNextActionMs = now;
+    return;
+  }
+
+  if (ledPattern == LED_PATTERN_FAULT) {
+    if (ledFaultSubsystem == 0xFF) {
+      ledPattern = LED_PATTERN_IDLE;
+      ledFaultSubsystem = 0;
+      ledNextActionMs = now;
+      return;
+    }
+    if (!ledFaultGap) {
+      setLedRed(0);
+      ledFaultFlashesRemaining--;
+      if (ledFaultFlashesRemaining > 0) {
+        ledFaultGap = true;
+        ledNextActionMs = now + 125;
+      } else {
+        ledFaultGap = false;
+        ledNextActionMs = now + 700;
+        // A completed subsystem code is followed by the next active code.
+        int next = findNextFaultSubsystem((ledFaultSubsystem + 1) % 3);
+        if (next >= 0 && next != ledFaultSubsystem) {
+          ledFaultSubsystem = (uint8_t)next;
+          ledFaultFlashesRemaining = ledFaultSubsystem + 1;
+          ledFaultGap = true;
+        } else {
+          ledFaultSubsystem = 0xFF;
+        }
+      }
+    } else {
+      if (ledFaultSubsystem == 0xFF) {
+        ledPattern = LED_PATTERN_IDLE;
+        ledFaultSubsystem = 0;
+        ledNextActionMs = now;
+      } else {
+        setLedRed(32);
+        ledFaultGap = false;
+        ledNextActionMs = now + 85;
+      }
+    }
+    return;
+  }
+
+  // IDLE: faults take priority, then a queued transition indication, then the
+  // very short healthy heartbeat every ten seconds.
+  int firstFault = findNextFaultSubsystem(0);
+  if (firstFault >= 0) {
+    startLedFaultPattern((uint8_t)firstFault);
+    return;
+  }
+
+  if (ledTransitionPending) {
+    startLedTransitionPattern();
+    return;
+  }
+
+  if (now - ledLastHeartbeatMs >= LED_HEARTBEAT_INTERVAL_MS) {
+    ledPattern = LED_PATTERN_HEARTBEAT;
+    setLedRed(6);
+    ledNextActionMs = now + LED_HEARTBEAT_PULSE_MS;
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Wi-Fi AP + infrastructure station
 // -----------------------------------------------------------------------------
 
@@ -554,6 +1117,7 @@ void startWiFi() {
   wifiApStarted = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
 
   if (wifiApStarted) {
+    clearFault(FAULT_WIFI_AP, "Wi-Fi access point started successfully");
     addEvent("INFO", "Wi-Fi access point started");
     Serial.println(F("[Wi-Fi] AP: PASS"));
     Serial.print(F("[Wi-Fi] AP SSID: "));
@@ -561,6 +1125,7 @@ void startWiFi() {
     Serial.print(F("[Wi-Fi] AP IP:   "));
     Serial.println(WiFi.softAPIP());
   } else {
+    setFault(FAULT_WIFI_AP, "WIFI", 1, "Wi-Fi access point failed to start");
     addEvent("ERROR", "Wi-Fi access point failed to start");
     Serial.println(F("[Wi-Fi] AP: FAIL"));
   }
@@ -591,6 +1156,10 @@ void startStationConnection(const String &ssid, const String &password, bool sav
   }
 
   wifiStaManuallyDisconnected = false;
+  if (isFaultActive(FAULT_WIFI_STA)) {
+    enqueueFaultEvent("WIFI", "RECOVERY_ATTEMPT", activeFaults[FAULT_WIFI_STA].code,
+                      "Retrying infrastructure Wi-Fi connection");
+  }
   wifiStaConnecting = true;
   wifiStaConnected = false;
   wifiStaWasConnected = false;
@@ -631,6 +1200,8 @@ void updateWiFiState() {
       Serial.print(F("[Wi-Fi] STA connected. IP: "));
       Serial.println(WiFi.localIP());
 
+      clearFault(FAULT_WIFI_STA, "Infrastructure Wi-Fi connected");
+      requestLedTransition();
       captureBootCheckpoint("STA connected");
     }
     return;
@@ -645,6 +1216,9 @@ void updateWiFiState() {
 
 
     addEvent("WARN", "Infrastructure Wi-Fi disconnected");
+    if (!wifiStaManuallyDisconnected) {
+      setFault(FAULT_WIFI_STA, "WIFI", 2, "Configured infrastructure Wi-Fi disconnected");
+    }
 
     Serial.println(F("[Wi-Fi] STA disconnected."));
     nextStaRetryMs = millis() + WIFI_RETRY_INTERVAL_MS;
@@ -652,6 +1226,9 @@ void updateWiFiState() {
 
   if (wifiStaManuallyDisconnected || configuredStaSsid.length() == 0) {
     wifiStaConnecting = false;
+    if (wifiStaManuallyDisconnected || configuredStaSsid.length() == 0) {
+      clearFault(FAULT_WIFI_STA, "Infrastructure Wi-Fi is no longer expected to be connected");
+    }
     return;
   }
 
@@ -660,6 +1237,7 @@ void updateWiFiState() {
       wifiStaConnecting = false;
       nextStaRetryMs = millis() + WIFI_RETRY_INTERVAL_MS;
       addEvent("WARN", "Infrastructure connection timed out");
+      setFault(FAULT_WIFI_STA, "WIFI", 3, "Infrastructure Wi-Fi connection timed out");
       Serial.println(F("[Wi-Fi] Connection timed out; retry scheduled."));
     }
     return;
@@ -712,8 +1290,12 @@ void printWiFiStatus() {
   Serial.println(configuredStaSsid.length() ? F("YES") : F("NO"));
   Serial.print(F("STA SSID:             "));
   Serial.println(configuredStaSsid.length() ? configuredStaSsid : String("(not configured)"));
-  Serial.print(F("STA connected:        "));
-  Serial.println(wifiStaConnected ? F("YES") : F("NO"));
+  Serial.print(F("STA state:            "));
+  if (wifiStaConnected) Serial.println(F("CONNECTED"));
+  else if (wifiStaConnecting) Serial.println(F("CONNECTING"));
+  else if (wifiStaManuallyDisconnected) Serial.println(F("MANUALLY DISCONNECTED"));
+  else if (configuredStaSsid.length() == 0) Serial.println(F("NOT CONFIGURED"));
+  else Serial.println(F("DISCONNECTED"));
   Serial.print(F("STA IP:               "));
   Serial.println(wifiStaConnected ? WiFi.localIP().toString() : String("0.0.0.0"));
   Serial.print(F("STA RSSI:             "));
@@ -751,6 +1333,7 @@ void initializeSDCard() {
 
   if (SD.begin(SD_CS_PIN, SPI, SD_SPI_FREQUENCY)) {
     sdReady = true;
+    clearFault(FAULT_SD_MOUNT, "SD card mounted successfully");
     addEvent("INFO", "SD card mounted");
     Serial.println(F("[SD] Mount: PASS"));
     refreshSDInformation();
@@ -759,6 +1342,7 @@ void initializeSDCard() {
       if (SD.mkdir(SD_TEST_DIRECTORY)) {
         Serial.println(F("[SD] Created /diag directory."));
       } else {
+        setFault(FAULT_SD_LOG, "SD", 2, "Could not create SD diagnostic directory");
         addEvent("WARN", "Could not create SD diagnostic directory");
         Serial.println(F("[SD] WARNING: Could not create /diag directory."));
       }
@@ -769,10 +1353,44 @@ void initializeSDCard() {
     sdReady = false;
     sdMountFailures++;
     sdLastResult = "Card mount failed";
+    setFault(FAULT_SD_MOUNT, "SD", 1, "SD card mount failed");
     addEvent("ERROR", "SD mount failed");
     Serial.println(F("[SD] Mount: FAIL"));
     Serial.println(F("[SD] Check card insertion, format, and pinout."));
   }
+}
+
+void remountSDCard() {
+  if (sdTestRunning) {
+    Serial.println(F("[SD] Remount rejected: SD diagnostic test is running."));
+    return;
+  }
+
+  Serial.println(F("[SD] Unmounting and retrying card initialization..."));
+  if (isFaultActive(FAULT_SD_MOUNT)) {
+    enqueueFaultEvent("SD", "RECOVERY_ATTEMPT", activeFaults[FAULT_SD_MOUNT].code,
+                      "Manual SD remount requested");
+  }
+  if (isFaultActive(FAULT_SD_TEST)) {
+    enqueueFaultEvent("SD", "RECOVERY_ATTEMPT", activeFaults[FAULT_SD_TEST].code,
+                      "Manual SD verification retry requested");
+  }
+  if (isFaultActive(FAULT_SD_LOG)) {
+    enqueueFaultEvent("SD", "RECOVERY_ATTEMPT", activeFaults[FAULT_SD_LOG].code,
+                      "Manual SD fault-log recovery requested");
+  }
+  SD.end();
+  sdReady = false;
+  sdTestPassed = false;
+  faultLogReady = false;
+  sdCardCapacityBytes = 0;
+  sdTotalBytes = 0;
+  sdUsedBytes = 0;
+
+  initializeSDCard();
+  serviceFaultLog();
+  Serial.println(sdReady && sdTestPassed ? F("[SD] Remount and verification: PASS")
+                                         : F("[SD] Remount and verification: FAIL"));
 }
 
 void refreshSDInformation() {
@@ -819,10 +1437,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V03 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V04 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V03 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V04 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -833,6 +1451,7 @@ bool runSDTest() {
     sdLastResult = reason;
     sdTestDurationMs = millis() - testStartMs;
     sdTestRunning = false;
+    setFault(FAULT_SD_TEST, "SD", 2, reason);
     addEvent("ERROR", reason);
     Serial.print(F("[SD TEST] FAIL: "));
     Serial.println(reason);
@@ -925,12 +1544,15 @@ bool runSDTest() {
 
   if (sdTestPassed) {
     sdLastResult = "PASS - write, append, readback verified";
+    clearFault(FAULT_SD_TEST, "SD write/append/readback test passed");
+    requestLedTransition();
     addEvent("INFO", "SD write/append/readback test passed");
     Serial.println(F("[SD TEST] Initial write: PASS"));
     Serial.println(F("[SD TEST] Append:        PASS"));
     Serial.println(F("[SD TEST] Readback:      PASS"));
   } else {
     sdLastResult = "FAIL - readback content mismatch";
+    setFault(FAULT_SD_TEST, "SD", 2, "SD readback content mismatch");
     addEvent("ERROR", "SD readback content mismatch");
     Serial.println(F("[SD TEST] FAIL: readback content mismatch."));
     Serial.println(contents);
@@ -969,6 +1591,7 @@ void configureWebServer() {
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
+  server.on("/api/faults", HTTP_GET, handleFaults);
   server.on("/api/test", HTTP_GET, handleSDTest);
   server.on("/api/client-error", HTTP_POST, handleClientError);
   server.onNotFound(handleNotFound);
@@ -1152,26 +1775,39 @@ String jsonEscape(const String &value) {
 
 String getSystemHealth() {
   if (!wifiApStarted || !sdReady || !sdTestPassed) return "FAIL";
-  if (!preferencesReady || !mdnsStarted || sdWriteFailures || sdReadFailures || sdMountFailures ||
-      httpErrorResponses || httpClientErrorReports ||
-      (configuredStaSsid.length() > 0 && !wifiStaConnected)) return "WARN";
+  if (!preferencesReady || !diagnosticPreferencesReady || !faultBootIdPersistent ||
+      !mdnsStarted || sdWriteFailures || sdReadFailures || sdMountFailures ||
+      httpErrorResponses || httpClientErrorReports || getActiveFaultCount() ||
+      faultQueueDropCount || faultLogWriteFailures ||
+      (configuredStaSsid.length() > 0 && !wifiStaConnected &&
+       !wifiStaConnecting && !wifiStaManuallyDisconnected)) return "WARN";
   return "PASS";
 }
 
 String getSystemHealthDetails() {
   String details;
-  details.reserve(220);
-  if (!wifiApStarted) details += "Access point failed to start; ";
+  details.reserve(420);
+  if (!wifiApStarted) details += "Wi-Fi access point failed to start; ";
   if (!sdReady) details += "SD card is not mounted; ";
   if (!sdTestPassed) details += "Latest SD verification has not passed; ";
-  if (!preferencesReady) details += "NVS Preferences unavailable; ";
+  if (!preferencesReady) details += "Network Preferences unavailable; ";
+  if (!diagnosticPreferencesReady || !faultBootIdPersistent) details += "Persistent diagnostic boot ID unavailable; ";
   if (!mdnsStarted) details += "mDNS responder is not running; ";
   if (sdMountFailures) details += "SD mount failures=" + String(sdMountFailures) + "; ";
   if (sdWriteFailures) details += "SD write failures=" + String(sdWriteFailures) + "; ";
   if (sdReadFailures) details += "SD read failures=" + String(sdReadFailures) + "; ";
   if (httpErrorResponses) details += "HTTP 4xx/5xx responses=" + String(httpErrorResponses) + "; ";
-  if (httpClientErrorReports) details += "Browser fetch error reports=" + String(httpClientErrorReports) + "; ";
-  if (configuredStaSsid.length() > 0 && !wifiStaConnected) details += "Configured infrastructure Wi-Fi is disconnected; ";
+  if (httpClientErrorReports) details += "Browser-reported fetch errors=" + String(httpClientErrorReports) + "; ";
+  if (configuredStaSsid.length() > 0 && !wifiStaConnected && !wifiStaConnecting &&
+      !wifiStaManuallyDisconnected) details += "Configured infrastructure Wi-Fi is disconnected; ";
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (activeFaults[i].active) {
+      details += String(activeFaults[i].subsystem) + " fault: " +
+                 String(activeFaults[i].description) + "; ";
+    }
+  }
+  if (faultQueueDropCount) details += "Fault-event queue drops=" + String(faultQueueDropCount) + "; ";
+  if (faultLogWriteFailures) details += "Fault-file write failures=" + String(faultLogWriteFailures) + "; ";
   if (details.length() == 0) return "No active health warnings.";
   details.remove(details.length() - 2);
   return details;
@@ -1227,6 +1863,12 @@ String makeStatusJson() {
   json += ",\"staSsid\":\"" + jsonEscape(configuredStaSsid) + "\",";
   json += "\"staConnected\":";
   json += (wifiStaConnected ? "true" : "false");
+  const char *staState = wifiStaConnected ? "CONNECTED" :
+                         (wifiStaConnecting ? "CONNECTING" :
+                         (wifiStaManuallyDisconnected ? "MANUALLY_DISCONNECTED" :
+                         (configuredStaSsid.length() == 0 ? "NOT_CONFIGURED" : "DISCONNECTED")));
+  json += ",\"staState\":\"" + String(staState) + "\",";
+  json += "\"staConnecting\":" + String(wifiStaConnecting ? "true" : "false");
   json += ",\"staIp\":\"" + (wifiStaConnected ? WiFi.localIP().toString() : String("0.0.0.0")) + "\",";
   json += "\"staRssi\":" + String(wifiStaConnected ? WiFi.RSSI() : 0) + ",";
   json += "\"staMac\":\"" + WiFi.macAddress() + "\",";
@@ -1286,6 +1928,12 @@ String makeStatusJson() {
   json += "\"loopEventHistoryCount\":" + String(loopEventCount) + ",";
   json += "\"eventCount\":" + String(eventCount) + ",";
   json += "\"bootCheckpointCount\":" + String(bootCheckpointCount) + ",";
+  json += "\"faultActiveCount\":" + String(getActiveFaultCount()) + ",";
+  json += "\"faultQueueCount\":" + String(faultQueueCount) + ",";
+  json += "\"faultQueueDrops\":" + String(faultQueueDropCount) + ",";
+  json += "\"faultLogReady\":" + String(faultLogReady ? "true" : "false") + ",";
+  json += "\"faultLogWriteFailures\":" + String(faultLogWriteFailures) + ",";
+  json += "\"ledState\":\"" + String(getLedPatternText()) + "\",";
   json += "\"canInitialized\":false";
   json += "}";
 
@@ -1357,7 +2005,7 @@ String makeLoopEventsJson() {
 
 String htmlPage() {
   String page;
-  page.reserve(12500);
+  page.reserve(18000);
 
   page += R"rawliteral(
 <!DOCTYPE html>
@@ -1394,7 +2042,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V03</p>
+<p class="sub">System dashboard - V04</p>
 
 <div class="grid">
   <section class="card">
@@ -1447,6 +2095,16 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   </section>
 
   <section class="card">
+    <h2>Fault diagnostics</h2>
+    <div class="row"><span>Active faults</span><span class="value" id="faultActiveCount">--</span></div>
+    <div class="row"><span>LED indication</span><span class="value" id="ledState">--</span></div>
+    <div class="row"><span>Fault log</span><span class="value" id="faultLogReady">--</span></div>
+    <div class="row"><span>Queued events / drops</span><span class="value" id="faultQueue">--</span></div>
+    <div id="activeFaults" class="small muted">Loading active faults...</div>
+    <div id="faultEvents" class="small muted">Loading fault history...</div>
+  </section>
+
+  <section class="card">
     <h2>microSD</h2>
     <div class="row"><span>Mount status</span><span class="value" id="sdReady">--</span></div>
     <div class="row"><span>Card type</span><span class="value" id="sdCardType">--</span></div>
@@ -1473,7 +2131,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <h2>HTTP diagnostics</h2>
     <div class="row"><span>Total requests</span><span class="value" id="httpRequests">--</span></div>
     <div class="row"><span>Status requests</span><span class="value" id="httpStatusRequests">--</span></div>
-    <div class="row"><span>Browser fetch reports</span><span class="value" id="httpClientErrorReports">--</span></div>
+    <div class="row"><span>Browser-reported fetch errors</span><span class="value" id="httpClientErrorReports">--</span></div>
     <div class="row"><span>HTTP error responses</span><span class="value" id="httpErrorResponses">--</span></div>
     <div class="row"><span>Last route / status</span><span class="value" id="httpLastRoute">--</span></div>
     <div class="row"><span>Last / max handler time</span><span class="value" id="httpTiming">--</span></div>
@@ -1511,7 +2169,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI is intentionally inactive in V03.</p>
+<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI is intentionally inactive in V04.</p>
 </main>
 
 <script>
@@ -1559,7 +2217,7 @@ async function refreshStatus(){
     setText('apIp',s.apIp);
     setText('apClients',s.apClients);
     setText('staSsid',s.staConfigured?s.staSsid:'Not configured');
-    setText('staConnected',s.staConnected?'CONNECTED':'DISCONNECTED');
+    setText('staConnected',s.staState|| (s.staConnected?'CONNECTED':'DISCONNECTED'));
     setText('staIp',s.staIp);
     setText('staRssi',s.staConnected?s.staRssi+' dBm':'N/A');
     setText('staAttempts',s.staAttempts);
@@ -1591,11 +2249,30 @@ async function refreshStatus(){
     setText('loopDuration',s.loopLastDurationUs+' / '+s.loopMaxDurationUs+' us');
     setText('loopGap',s.loopLastGapUs+' / '+s.loopMaxGapUs+' us');
     setText('eventCount',s.eventCount);
+    setText('faultActiveCount',s.faultActiveCount);
+    setText('ledState',s.ledState);
+    setText('faultLogReady',s.faultLogReady?'READY':'NOT READY');
+    setText('faultQueue',s.faultQueueCount+' / '+s.faultQueueDrops);
     setText('message','');
   }catch(e){
     setText('message','Status refresh failed: '+e.message);
     reportBrowserError('/api/status',e);
   }
+}
+async function refreshFaults(){
+  try{
+    const data=await fetchJson('/api/faults');
+    const active=document.getElementById('activeFaults');
+    if(!data.active.length){active.textContent='No active subsystem faults.';}
+    else{active.textContent=data.active.map(f=>f.subsystem+' code '+f.code+': '+f.description).join('\n');active.style.whiteSpace='pre-wrap';}
+    const history=document.getElementById('faultEvents');
+    if(!data.events.length){history.textContent='No fault/recovery events retained.';}
+    else{history.textContent=data.events.map(e=>e.timestampUs+' us  '+e.subsystem+' '+e.event+' ['+e.code+'] '+e.description).join('\n');history.style.whiteSpace='pre-wrap';}
+    setText('faultActiveCount',data.activeCount);
+    setText('ledState',data.ledState);
+    setText('faultLogReady',data.logReady?'READY':'NOT READY');
+    setText('faultQueue',data.queueCount+' / '+data.queueDrops);
+  }catch(e){document.getElementById('faultEvents').textContent='Fault history unavailable: '+e.message;}
 }
 async function refreshEvents(){
   try{
@@ -1642,10 +2319,12 @@ async function refreshLoopEvents(){
   }catch(e){document.getElementById('loopEvents').textContent='Loop history unavailable: '+e.message;}
 }
 refreshStatus();
+refreshFaults();
 refreshEvents();
 refreshHttpErrors();
 refreshLoopEvents();
 setInterval(refreshStatus,5000);
+setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
 setInterval(refreshHttpErrors,15000);
 setInterval(refreshLoopEvents,15000);
@@ -1717,6 +2396,12 @@ void processSerialCommand(char *command) {
     printStatus();
   } else if (!strcmp(command, "events")) {
     printEvents();
+  } else if (!strcmp(command, "faults")) {
+    printFaults();
+  } else if (!strcmp(command, "faults clear")) {
+    faultHistoryHead = 0;
+    faultHistoryCount = 0;
+    Serial.println(F("[FAULTS] RAM event history cleared. Active faults, queued SD records, and /diag/FAULTS.CSV preserved."));
   } else if (!strcmp(command, "httperrors")) {
     printHttpErrors();
   } else if (!strcmp(command, "loopevents")) {
@@ -1725,6 +2410,8 @@ void processSerialCommand(char *command) {
     printBootCheckpoints();
   } else if (!strcmp(command, "sdtest")) {
     runSDTest();
+  } else if (!strcmp(command, "sd remount")) {
+    remountSDCard();
   } else if (!strcmp(command, "wifi status")) {
     printWiFiStatus();
   } else if (!strcmp(command, "wifi disconnect")) {
@@ -1734,6 +2421,7 @@ void processSerialCommand(char *command) {
     wifiStaConnected = false;
     wifiStaWasConnected = false;
     nextStaRetryMs = 0;
+    clearFault(FAULT_WIFI_STA, "Infrastructure Wi-Fi manually disconnected by user");
     addEvent("INFO", "Infrastructure Wi-Fi manually disconnected");
     Serial.println(F("[Wi-Fi] Disconnected. Saved credentials retained."));
   } else if (!strcmp(command, "wifi forget")) {
@@ -1744,6 +2432,7 @@ void processSerialCommand(char *command) {
     wifiStaWasConnected = false;
     configuredStaSsid = "";
     configuredStaPassword = "";
+    clearFault(FAULT_WIFI_STA, "Infrastructure Wi-Fi credentials removed by user");
     if (preferencesReady) {
       preferences.remove("ssid");
       preferences.remove("pass");
@@ -1776,10 +2465,13 @@ void printHelp() {
   Serial.println(F("help                         Show commands"));
   Serial.println(F("status                       Full system status"));
   Serial.println(F("events                       Recent diagnostic event history"));
+  Serial.println(F("faults                       Active faults and recent fault/recovery events"));
+  Serial.println(F("faults clear                 Clear RAM history; preserve active/pending/persistent faults"));
   Serial.println(F("httperrors                   Recent HTTP 4xx/5xx requests"));
   Serial.println(F("loopevents                   Recent loop timing anomalies (>=100 ms)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
+  Serial.println(F("sd remount                    Unmount, remount, and verify the SD card"));
   Serial.println(F("wifi status                  Show AP and infrastructure status"));
   Serial.println(F("wifi connect SSID|PASSWORD  Save credentials and connect"));
   Serial.println(F("wifi disconnect              Disconnect; retain saved credentials"));
@@ -1871,6 +2563,32 @@ void printStatus() {
   Serial.println();
   Serial.print(F("Diagnostic events:    ")); Serial.println(eventCount);
   Serial.print(F("Boot checkpoints:     ")); Serial.println(bootCheckpointCount);
+  Serial.print(F("Active faults:        ")); Serial.println(getActiveFaultCount());
+  for (uint8_t i = 0; i < FAULT_ID_COUNT; i++) {
+    if (activeFaults[i].active) {
+      Serial.print(F("  ")); Serial.print(activeFaults[i].subsystem);
+      Serial.print(F(": ")); Serial.println(activeFaults[i].description);
+    }
+  }
+  Serial.print(F("Fault event queue:    ")); Serial.print(faultQueueCount); Serial.print(F(" queued; ")); Serial.print(faultQueueDropCount); Serial.println(F(" dropped"));
+ Serial.print(F("Fault file:           "));
+if (faultLogReady) {
+  Serial.println(FAULT_LOG_FILE);
+} else {
+  Serial.println(F("NOT READY"));
+}
+  Serial.print(F("Fault file writes:    ")); Serial.print(faultLogWriteCount); Serial.print(F(" pass; ")); Serial.println(faultLogWriteFailures);
+  if (faultHistoryCount) {
+    uint8_t lastIndex = (faultHistoryHead + FAULT_HISTORY_SIZE - 1) % FAULT_HISTORY_SIZE;
+    const FaultEventRecord &lastFaultEvent = faultEventHistory[lastIndex];
+    Serial.print(F("Last fault event:     "));
+    Serial.print(lastFaultEvent.subsystem); Serial.print(' ');
+    Serial.print(lastFaultEvent.event); Serial.print(F(" - "));
+    Serial.println(lastFaultEvent.description);
+  } else {
+    Serial.println(F("Last fault event:     None retained"));
+  }
+  Serial.print(F("Diagnostic LED:       ")); Serial.print(getLedPatternText()); Serial.print(F(" on GPIO")); Serial.println(RGB_LED_DATA_PIN);
   Serial.println(F("CAN/TWAI:             NOT INITIALIZED"));
   Serial.println();
 }
