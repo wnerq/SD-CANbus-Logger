@@ -1,12 +1,19 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V07
+  Firmware: V08
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V07 purpose:
+  V08 purpose:
+    - Add a bounded, versioned RAM diagnostic recorder independent of browser navigation.
+    - Record periodic subsystem samples and significant diagnostic events.
+    - Provide serial and browser controls, status, and CSV export.
+    - Make the loop timing event threshold configurable.
+    - Preserve the V07 CAN acquisition and binary capture architecture.
+
+  V07 foundation:
     - Preserve the V05 Wi-Fi, SD, HTTP, and diagnostic foundation.
     - Distinguish Wi-Fi CONNECTING from an actual disconnected fault.
     - Drive the onboard WS2812-compatible RGB LED on GPIO4 using the
@@ -39,6 +46,9 @@
     httperrors
     loopevents
     checkpoints
+    verbose status|on|off|freeze|resume|clear
+    verbose interval <ms>
+    diag threshold [ms]
     sdtest
     sd remount
     reset
@@ -77,6 +87,8 @@
     /api/events       Recent diagnostic events
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
+    /api/verbose      Verbose recorder status and controls
+    /download-verbose Download RAM diagnostic records as CSV
     /api/faults       Active faults and recent fault/recovery events
     /api/files         List files in an approved SD directory
     /api/file          View an SD file as text
@@ -90,7 +102,7 @@
     - Select the appropriate ESP32 Dev Module board definition.
     - CAN/TWAI starts at 250 kbit/s in listen-only mode. A dedicated task drains
       the driver RX queue and stores a bounded in-RAM frame history.
-    - V07 writes received CAN frames to versioned binary files using a bounded
+    - The CAN logger writes received frames to versioned binary files using a bounded
       FreeRTOS queue; the CAN receive task never performs SD operations.
     - GPIO4 drives the onboard WS2812-compatible addressable RGB LED.
 */
@@ -116,7 +128,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V07";
+static const char FIRMWARE_VERSION[] = "V08";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -166,7 +178,7 @@ static const uint8_t EVENT_HISTORY_SIZE = 32;
 static const uint8_t MAX_BOOT_CHECKPOINTS = 12;
 static const uint8_t HTTP_ERROR_HISTORY_SIZE = 8;
 static const uint8_t LOOP_EVENT_HISTORY_SIZE = 8;
-static const uint32_t LOOP_DIAGNOSTIC_THRESHOLD_US = 100000; // 100 ms
+static uint32_t loopDiagnosticThresholdMs = 100; // Default 100 ms; configurable 10-1000 ms
 
 struct DiagnosticEvent {
   uint32_t uptimeMs;
@@ -317,6 +329,108 @@ LoopTimingRecord loopEventHistory[LOOP_EVENT_HISTORY_SIZE];
 uint8_t loopEventHead = 0;
 uint8_t loopEventCount = 0;
 uint32_t loopTimingEventCount = 0;
+
+// -----------------------------------------------------------------------------
+// V08 verbose diagnostic recorder
+// -----------------------------------------------------------------------------
+
+static const uint16_t DIAG_RECORD_CAPACITY = 512;
+static const uint16_t DIAG_RECORD_FORMAT_VERSION = 1;
+static const uint32_t DIAG_DEFAULT_SAMPLE_INTERVAL_MS = 1000;
+static const uint32_t DIAG_SLOW_SAMPLE_INTERVAL_MS = 5000;
+static const uint32_t DIAG_MIN_SAMPLE_INTERVAL_MS = 250;
+static const uint32_t DIAG_MAX_SAMPLE_INTERVAL_MS = 10000;
+static const uint32_t DIAG_MIN_LOOP_THRESHOLD_MS = 10;
+static const uint32_t DIAG_MAX_LOOP_THRESHOLD_MS = 1000;
+
+enum DiagnosticRecordType : uint8_t {
+  DIAG_TYPE_U32 = 1,
+  DIAG_TYPE_I32 = 2,
+  DIAG_TYPE_BOOL = 3,
+  DIAG_TYPE_EVENT = 4
+};
+
+enum DiagnosticRecordId : uint16_t {
+  DIAG_ID_BOOT = 1,
+  DIAG_ID_EVENT_HASH,
+  DIAG_ID_FAULT_STATE,
+  DIAG_ID_LOOP_GAP_US,
+  DIAG_ID_LOOP_DURATION_US,
+  DIAG_ID_HTTP_HANDLER_US,
+  DIAG_ID_HTTP_ROUTE_HASH,
+  DIAG_ID_HEAP_FREE_BYTES,
+  DIAG_ID_HEAP_LARGEST_BYTES,
+  DIAG_ID_LOOP_LAST_GAP_US,
+  DIAG_ID_LOOP_LAST_DURATION_US,
+  DIAG_ID_WIFI_RSSI_DBM,
+  DIAG_ID_CAN_FRAMES_RECEIVED,
+  DIAG_ID_CAN_RECEIVE_ERRORS,
+  DIAG_ID_CAN_RX_QUEUE_DEPTH,
+  DIAG_ID_CAN_LOG_QUEUE_DEPTH,
+  DIAG_ID_CAN_LOG_QUEUE_DROPS,
+  DIAG_ID_SD_WRITE_FAILURES,
+  DIAG_ID_SD_READ_FAILURES,
+  DIAG_ID_SD_WRITE_DURATION_MS,
+  DIAG_ID_SD_READ_DURATION_MS,
+  DIAG_ID_CAN_LOG_WRITE_MS,
+  DIAG_ID_CAN_LOG_BATCH_RECORDS,
+  DIAG_ID_ACTIVE_FAULT_COUNT,
+  DIAG_ID_HEAP_MIN_FREE_BYTES,
+  DIAG_ID_HEAP_INTERNAL_FREE_BYTES,
+  DIAG_ID_WIFI_AP_CLIENTS,
+  DIAG_ID_WIFI_STA_STATE,
+  DIAG_ID_WIFI_DISCONNECTS,
+  DIAG_ID_SD_MOUNTED,
+  DIAG_ID_SD_MOUNT_FAILURES,
+  DIAG_ID_SD_WRITE_OPERATIONS,
+  DIAG_ID_SD_READ_OPERATIONS,
+  DIAG_ID_SD_LAST_WRITE_MS,
+  DIAG_ID_SD_LAST_READ_MS,
+  DIAG_ID_HTTP_REQUESTS,
+  DIAG_ID_HTTP_ERRORS,
+  DIAG_ID_HTTP_CLIENT_ERRORS,
+  DIAG_ID_LOOP_ITERATIONS,
+  DIAG_ID_LOOP_MAX_DURATION_US,
+  DIAG_ID_LOOP_MAX_GAP_US,
+  DIAG_ID_CAN_BUS_OFF_COUNT,
+  DIAG_ID_CAN_RECOVERY_COUNT,
+  DIAG_ID_CAN_BUS_ERRORS,
+  DIAG_ID_CAN_DRIVER_MISSED,
+  DIAG_ID_CAN_LOG_STATE,
+  DIAG_ID_CAN_LOG_FRAMES_WRITTEN,
+  DIAG_ID_CAN_LOG_WRITE_FAILURES,
+  DIAG_ID_CAN_LOG_LAST_WRITE_MS,
+  DIAG_ID_FAULT_QUEUE_DROPS
+};
+
+#pragma pack(push, 1)
+struct DiagnosticRecord {
+  uint64_t timestampUs;
+  uint16_t recordId;
+  uint8_t dataType;
+  uint8_t flags;
+  uint32_t value;
+  uint32_t context;
+};
+#pragma pack(pop)
+static_assert(sizeof(DiagnosticRecord) == 20, "Diagnostic record size changed");
+
+DiagnosticRecord diagnosticRecords[DIAG_RECORD_CAPACITY];
+uint16_t diagnosticRecordHead = 0;
+uint16_t diagnosticRecordCount = 0;
+uint32_t diagnosticRecordsTotal = 0;
+uint32_t diagnosticRecordsOverwritten = 0;
+uint32_t diagnosticClearCount = 0;
+uint32_t diagnosticSampleIntervalMs = DIAG_DEFAULT_SAMPLE_INTERVAL_MS;
+uint32_t diagnosticLastSampleMs = 0;
+uint32_t diagnosticLastSlowSampleMs = 0;
+uint32_t diagnosticLastRecordCostUs = 0;
+uint32_t diagnosticMaxRecordCostUs = 0;
+uint32_t diagnosticLastSampleCostUs = 0;
+uint32_t diagnosticMaxSampleCostUs = 0;
+bool verboseLoggingEnabled = false;
+bool verboseLoggingFrozen = false;
+portMUX_TYPE diagnosticMux = portMUX_INITIALIZER_UNLOCKED;
 
 // -----------------------------------------------------------------------------
 // Runtime objects
@@ -474,6 +588,24 @@ void printHttpErrors();
 void printLoopEvents();
 void addHttpError(const char *method, const char *uri, uint16_t statusCode);
 void addLoopTimingEvent();
+void recordDiagnostic(uint16_t recordId, uint8_t dataType, uint32_t value,
+                      uint32_t context = 0, uint8_t flags = 0);
+uint32_t diagnosticStringHash(const char *text);
+const char *diagnosticRecordName(uint16_t recordId);
+const char *diagnosticRecordTypeName(uint8_t dataType);
+const char *diagnosticRecordDetail(const DiagnosticRecord &record);
+void serviceVerboseDiagnostics();
+void printVerboseStatus();
+void setVerboseLogging(bool enabled);
+void clearVerboseRecords();
+String makeVerboseStatusJson();
+void handleVerboseStatus();
+void handleVerboseStart();
+void handleVerboseStop();
+void handleVerboseClear();
+void handleVerboseFreeze();
+void handleVerboseResume();
+void handleVerboseDownload();
 
 void initializeFaultSystem();
 void enqueueFaultEvent(const char *subsystem, const char *eventName,
@@ -595,6 +727,7 @@ void setup() {
   Serial.println();
 
   initializeFaultSystem();
+  recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 8, ESP.getChipRevision());
   addEvent("INFO", "System startup");
   captureBootCheckpoint("Startup");
 
@@ -667,8 +800,8 @@ void loop() {
 
     // At this point loopLastDurationUs belongs to the preceding loop, so the
     // gap and duration describe the same start-to-start interval.
-    if (loopLastGapUs >= LOOP_DIAGNOSTIC_THRESHOLD_US ||
-        loopLastDurationUs >= LOOP_DIAGNOSTIC_THRESHOLD_US) {
+    const uint32_t thresholdUs = loopDiagnosticThresholdMs * 1000UL;
+    if (loopLastGapUs >= thresholdUs || loopLastDurationUs >= thresholdUs) {
       addLoopTimingEvent();
     }
   }
@@ -692,10 +825,327 @@ void loop() {
   }
 
   loopCount++;
+  serviceVerboseDiagnostics();
+}
+
+// -----------------------------------------------------------------------------
+// V08 verbose diagnostic recorder
+// -----------------------------------------------------------------------------
+
+uint32_t diagnosticStringHash(const char *text) {
+  // FNV-1a: stable compact identifier for route/event strings without storing
+  // dynamically allocated text in the recorder.
+  uint32_t hash = 2166136261UL;
+  if (!text) return hash;
+  while (*text) {
+    hash ^= (uint8_t)*text++;
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+const char *diagnosticRecordName(uint16_t recordId) {
+  switch (recordId) {
+    case DIAG_ID_BOOT: return "BOOT";
+    case DIAG_ID_EVENT_HASH: return "EVENT_HASH";
+    case DIAG_ID_FAULT_STATE: return "FAULT_STATE";
+    case DIAG_ID_LOOP_GAP_US: return "LOOP_GAP_US";
+    case DIAG_ID_LOOP_DURATION_US: return "LOOP_DURATION_US";
+    case DIAG_ID_HTTP_HANDLER_US: return "HTTP_HANDLER_US";
+    case DIAG_ID_HTTP_ROUTE_HASH: return "HTTP_ROUTE_HASH";
+    case DIAG_ID_HEAP_FREE_BYTES: return "HEAP_FREE_BYTES";
+    case DIAG_ID_HEAP_LARGEST_BYTES: return "HEAP_LARGEST_BYTES";
+    case DIAG_ID_LOOP_LAST_GAP_US: return "LOOP_LAST_GAP_US";
+    case DIAG_ID_LOOP_LAST_DURATION_US: return "LOOP_LAST_DURATION_US";
+    case DIAG_ID_WIFI_RSSI_DBM: return "WIFI_RSSI_DBM";
+    case DIAG_ID_CAN_FRAMES_RECEIVED: return "CAN_FRAMES_RECEIVED";
+    case DIAG_ID_CAN_RECEIVE_ERRORS: return "CAN_RECEIVE_ERRORS";
+    case DIAG_ID_CAN_RX_QUEUE_DEPTH: return "CAN_RX_QUEUE_DEPTH";
+    case DIAG_ID_CAN_LOG_QUEUE_DEPTH: return "CAN_LOG_QUEUE_DEPTH";
+    case DIAG_ID_CAN_LOG_QUEUE_DROPS: return "CAN_LOG_QUEUE_DROPS";
+    case DIAG_ID_SD_WRITE_FAILURES: return "SD_WRITE_FAILURES";
+    case DIAG_ID_SD_READ_FAILURES: return "SD_READ_FAILURES";
+    case DIAG_ID_SD_WRITE_DURATION_MS: return "SD_WRITE_DURATION_MS";
+    case DIAG_ID_SD_READ_DURATION_MS: return "SD_READ_DURATION_MS";
+    case DIAG_ID_CAN_LOG_WRITE_MS: return "CAN_LOG_WRITE_MS";
+    case DIAG_ID_CAN_LOG_BATCH_RECORDS: return "CAN_LOG_BATCH_RECORDS";
+    case DIAG_ID_ACTIVE_FAULT_COUNT: return "ACTIVE_FAULT_COUNT";
+    case DIAG_ID_HEAP_MIN_FREE_BYTES: return "HEAP_MIN_FREE_BYTES";
+    case DIAG_ID_HEAP_INTERNAL_FREE_BYTES: return "HEAP_INTERNAL_FREE_BYTES";
+    case DIAG_ID_WIFI_AP_CLIENTS: return "WIFI_AP_CLIENTS";
+    case DIAG_ID_WIFI_STA_STATE: return "WIFI_STA_STATE";
+    case DIAG_ID_WIFI_DISCONNECTS: return "WIFI_DISCONNECTS";
+    case DIAG_ID_SD_MOUNTED: return "SD_MOUNTED";
+    case DIAG_ID_SD_MOUNT_FAILURES: return "SD_MOUNT_FAILURES";
+    case DIAG_ID_SD_WRITE_OPERATIONS: return "SD_WRITE_OPERATIONS";
+    case DIAG_ID_SD_READ_OPERATIONS: return "SD_READ_OPERATIONS";
+    case DIAG_ID_SD_LAST_WRITE_MS: return "SD_LAST_WRITE_MS";
+    case DIAG_ID_SD_LAST_READ_MS: return "SD_LAST_READ_MS";
+    case DIAG_ID_HTTP_REQUESTS: return "HTTP_REQUESTS";
+    case DIAG_ID_HTTP_ERRORS: return "HTTP_ERRORS";
+    case DIAG_ID_HTTP_CLIENT_ERRORS: return "HTTP_CLIENT_ERRORS";
+    case DIAG_ID_LOOP_ITERATIONS: return "LOOP_ITERATIONS";
+    case DIAG_ID_LOOP_MAX_DURATION_US: return "LOOP_MAX_DURATION_US";
+    case DIAG_ID_LOOP_MAX_GAP_US: return "LOOP_MAX_GAP_US";
+    case DIAG_ID_CAN_BUS_OFF_COUNT: return "CAN_BUS_OFF_COUNT";
+    case DIAG_ID_CAN_RECOVERY_COUNT: return "CAN_RECOVERY_COUNT";
+    case DIAG_ID_CAN_BUS_ERRORS: return "CAN_BUS_ERRORS";
+    case DIAG_ID_CAN_DRIVER_MISSED: return "CAN_DRIVER_MISSED";
+    case DIAG_ID_CAN_LOG_STATE: return "CAN_LOG_STATE";
+    case DIAG_ID_CAN_LOG_FRAMES_WRITTEN: return "CAN_LOG_FRAMES_WRITTEN";
+    case DIAG_ID_CAN_LOG_WRITE_FAILURES: return "CAN_LOG_WRITE_FAILURES";
+    case DIAG_ID_CAN_LOG_LAST_WRITE_MS: return "CAN_LOG_LAST_WRITE_MS";
+    case DIAG_ID_FAULT_QUEUE_DROPS: return "FAULT_QUEUE_DROPS";
+    default: return "UNKNOWN";
+  }
+}
+
+const char *diagnosticRecordTypeName(uint8_t dataType) {
+  switch (dataType) {
+    case DIAG_TYPE_U32: return "U32";
+    case DIAG_TYPE_I32: return "I32";
+    case DIAG_TYPE_BOOL: return "BOOL";
+    case DIAG_TYPE_EVENT: return "EVENT";
+    default: return "UNKNOWN";
+  }
+}
+
+const char *diagnosticRecordDetail(const DiagnosticRecord &record) {
+  if (record.recordId == DIAG_ID_HTTP_ROUTE_HASH) {
+    static const char *routes[] = {
+      "/", "/api/status", "/api/can-frames", "/api/logging",
+      "/api/logging/start", "/api/logging/stop", "/api/events",
+      "/api/http-errors", "/api/loop-events", "/api/verbose",
+      "/api/verbose/start", "/api/verbose/stop", "/api/verbose/clear",
+      "/api/verbose/freeze", "/api/verbose/resume", "/download-verbose",
+      "/api/faults", "/api/files", "/api/file", "/download",
+      "/api/reset", "/api/test", "/api/client-error"
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+      if (diagnosticStringHash(routes[i]) == record.value) return routes[i];
+    }
+    return "unknown route hash";
+  }
+  if (record.recordId == DIAG_ID_EVENT_HASH) return "event message hash; correlate with event history";
+  if (record.recordId == DIAG_ID_FAULT_STATE) return record.flags ? "fault active" : "fault recovered";
+  if (record.recordId == DIAG_ID_WIFI_RSSI_DBM) return record.context ? "STA connected" : "STA disconnected";
+  if (record.recordId == DIAG_ID_WIFI_STA_STATE) {
+    switch (record.value) {
+      case 0: return "not configured";
+      case 1: return "connected";
+      case 2: return "connecting";
+      case 3: return "manually disconnected";
+      default: return "disconnected";
+    }
+  }
+  if (record.recordId == DIAG_ID_CAN_LOG_STATE) {
+    switch (record.value) {
+      case 1: return "recording";
+      case 2: return "stopping/draining";
+      default: return "stopped";
+    }
+  }
+  if (record.recordId == DIAG_ID_BOOT) return "firmware V08 boot/enable marker";
+  return "";
+}
+
+void recordDiagnostic(uint16_t recordId, uint8_t dataType, uint32_t value,
+                      uint32_t context, uint8_t flags) {
+  if (!verboseLoggingEnabled || verboseLoggingFrozen) return;
+  uint32_t startedUs = micros();
+
+  DiagnosticRecord record = {};
+  record.timestampUs = (uint64_t)esp_timer_get_time();
+  record.recordId = recordId;
+  record.dataType = dataType;
+  record.flags = flags;
+  record.value = value;
+  record.context = context;
+
+  portENTER_CRITICAL(&diagnosticMux);
+  if (verboseLoggingEnabled && !verboseLoggingFrozen) {
+    diagnosticRecords[diagnosticRecordHead] = record;
+    diagnosticRecordHead = (diagnosticRecordHead + 1) % DIAG_RECORD_CAPACITY;
+    if (diagnosticRecordCount < DIAG_RECORD_CAPACITY) {
+      diagnosticRecordCount++;
+    } else {
+      diagnosticRecordsOverwritten++;
+    }
+    diagnosticRecordsTotal++;
+  }
+  portEXIT_CRITICAL(&diagnosticMux);
+  diagnosticLastRecordCostUs = micros() - startedUs;
+  if (diagnosticLastRecordCostUs > diagnosticMaxRecordCostUs) {
+    diagnosticMaxRecordCostUs = diagnosticLastRecordCostUs;
+  }
+}
+
+void serviceVerboseDiagnostics() {
+  if (!verboseLoggingEnabled || verboseLoggingFrozen) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - diagnosticLastSampleMs) < diagnosticSampleIntervalMs) return;
+  diagnosticLastSampleMs = now;
+  uint32_t sampleStartedUs = micros();
+
+  // Fixed, low-rate samples. High-value transitions and operation timings are
+  // recorded at their source; this sample set captures subsystem trends.
+  recordDiagnostic(DIAG_ID_HEAP_FREE_BYTES, DIAG_TYPE_U32, ESP.getFreeHeap());
+  recordDiagnostic(DIAG_ID_HEAP_LARGEST_BYTES, DIAG_TYPE_U32,
+                   heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  recordDiagnostic(DIAG_ID_LOOP_LAST_GAP_US, DIAG_TYPE_U32, loopLastGapUs);
+  recordDiagnostic(DIAG_ID_LOOP_LAST_DURATION_US, DIAG_TYPE_U32, loopLastDurationUs);
+  uint32_t canFramesSnapshot, canReceiveErrorsSnapshot, canQueueDepthSnapshot;
+  portENTER_CRITICAL(&canMux);
+  canFramesSnapshot = canFramesReceived;
+  canReceiveErrorsSnapshot = canReceiveErrors;
+  canQueueDepthSnapshot = canDriverRxQueueDepth;
+  portEXIT_CRITICAL(&canMux);
+  recordDiagnostic(DIAG_ID_WIFI_RSSI_DBM, DIAG_TYPE_I32,
+                   (uint32_t)(int32_t)(wifiStaConnected ? WiFi.RSSI() : -127),
+                   wifiStaConnected ? 1 : 0);
+  recordDiagnostic(DIAG_ID_CAN_FRAMES_RECEIVED, DIAG_TYPE_U32, canFramesSnapshot);
+  recordDiagnostic(DIAG_ID_CAN_RECEIVE_ERRORS, DIAG_TYPE_U32, canReceiveErrorsSnapshot);
+  recordDiagnostic(DIAG_ID_CAN_RX_QUEUE_DEPTH, DIAG_TYPE_U32, canQueueDepthSnapshot);
+  recordDiagnostic(DIAG_ID_CAN_LOG_QUEUE_DEPTH, DIAG_TYPE_U32,
+                   canLogQueue ? uxQueueMessagesWaiting(canLogQueue) : 0);
+  recordDiagnostic(DIAG_ID_CAN_LOG_QUEUE_DROPS, DIAG_TYPE_U32, canLogQueueDrops);
+  recordDiagnostic(DIAG_ID_SD_WRITE_FAILURES, DIAG_TYPE_U32, sdWriteFailures);
+  recordDiagnostic(DIAG_ID_SD_READ_FAILURES, DIAG_TYPE_U32, sdReadFailures);
+  recordDiagnostic(DIAG_ID_ACTIVE_FAULT_COUNT, DIAG_TYPE_U32, getActiveFaultCount());
+
+  if ((uint32_t)(now - diagnosticLastSlowSampleMs) >= DIAG_SLOW_SAMPLE_INTERVAL_MS) {
+    diagnosticLastSlowSampleMs = now;
+    recordDiagnostic(DIAG_ID_HEAP_MIN_FREE_BYTES, DIAG_TYPE_U32, ESP.getMinFreeHeap());
+    recordDiagnostic(DIAG_ID_HEAP_INTERNAL_FREE_BYTES, DIAG_TYPE_U32,
+                     heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    recordDiagnostic(DIAG_ID_WIFI_AP_CLIENTS, DIAG_TYPE_U32, WiFi.softAPgetStationNum());
+    uint32_t staState = wifiStaConnected ? 1 : (wifiStaConnecting ? 2 :
+                         (wifiStaManuallyDisconnected ? 3 :
+                         (configuredStaSsid.length() == 0 ? 0 : 4)));
+    recordDiagnostic(DIAG_ID_WIFI_STA_STATE, DIAG_TYPE_U32, staState,
+                     (uint32_t)(lastStaDisconnectReason + 1));
+    recordDiagnostic(DIAG_ID_WIFI_DISCONNECTS, DIAG_TYPE_U32, staDisconnectCount);
+    recordDiagnostic(DIAG_ID_SD_MOUNTED, DIAG_TYPE_BOOL, sdReady ? 1 : 0);
+    recordDiagnostic(DIAG_ID_SD_MOUNT_FAILURES, DIAG_TYPE_U32, sdMountFailures);
+    recordDiagnostic(DIAG_ID_SD_WRITE_OPERATIONS, DIAG_TYPE_U32, sdWriteOperations);
+    recordDiagnostic(DIAG_ID_SD_READ_OPERATIONS, DIAG_TYPE_U32, sdReadOperations);
+    recordDiagnostic(DIAG_ID_SD_LAST_WRITE_MS, DIAG_TYPE_U32, sdLastWriteDurationMs);
+    recordDiagnostic(DIAG_ID_SD_LAST_READ_MS, DIAG_TYPE_U32, sdLastReadDurationMs);
+    recordDiagnostic(DIAG_ID_HTTP_REQUESTS, DIAG_TYPE_U32, httpRequests);
+    recordDiagnostic(DIAG_ID_HTTP_ERRORS, DIAG_TYPE_U32, httpErrorResponses);
+    recordDiagnostic(DIAG_ID_HTTP_CLIENT_ERRORS, DIAG_TYPE_U32, httpClientErrorReports);
+    recordDiagnostic(DIAG_ID_LOOP_ITERATIONS, DIAG_TYPE_U32, loopCount);
+    recordDiagnostic(DIAG_ID_LOOP_MAX_DURATION_US, DIAG_TYPE_U32, loopMaxDurationUs);
+    recordDiagnostic(DIAG_ID_LOOP_MAX_GAP_US, DIAG_TYPE_U32, loopMaxGapUs);
+    recordDiagnostic(DIAG_ID_CAN_BUS_OFF_COUNT, DIAG_TYPE_U32, canBusOffCount);
+    recordDiagnostic(DIAG_ID_CAN_RECOVERY_COUNT, DIAG_TYPE_U32, canRecoveryCount);
+    recordDiagnostic(DIAG_ID_CAN_BUS_ERRORS, DIAG_TYPE_U32, canDriverBusErrorCount);
+    recordDiagnostic(DIAG_ID_CAN_DRIVER_MISSED, DIAG_TYPE_U32,
+                     canDriverRxMissedCount + canDriverRxOverrunCount);
+    recordDiagnostic(DIAG_ID_CAN_LOG_STATE, DIAG_TYPE_BOOL,
+                     canLoggingActive ? 1 : (canLoggingStopping ? 2 : 0));
+    recordDiagnostic(DIAG_ID_CAN_LOG_FRAMES_WRITTEN, DIAG_TYPE_U32, canLogFramesWritten);
+    recordDiagnostic(DIAG_ID_CAN_LOG_WRITE_FAILURES, DIAG_TYPE_U32, canLogWriteFailures);
+    recordDiagnostic(DIAG_ID_CAN_LOG_LAST_WRITE_MS, DIAG_TYPE_U32, canLogLastWriteMs);
+    recordDiagnostic(DIAG_ID_FAULT_QUEUE_DROPS, DIAG_TYPE_U32, faultQueueDropCount);
+  }
+
+  diagnosticLastSampleCostUs = micros() - sampleStartedUs;
+  if (diagnosticLastSampleCostUs > diagnosticMaxSampleCostUs) {
+    diagnosticMaxSampleCostUs = diagnosticLastSampleCostUs;
+  }
+}
+
+void setVerboseLogging(bool enabled) {
+  if (enabled) {
+    verboseLoggingEnabled = true;
+    verboseLoggingFrozen = false;
+    diagnosticLastSampleMs = 0;
+    recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 8, 0, 1);
+    addEvent("INFO", "Verbose diagnostic recording enabled");
+  } else {
+    addEvent("INFO", "Verbose diagnostic recording disabled");
+    verboseLoggingEnabled = false;
+    verboseLoggingFrozen = false;
+  }
+  if (diagnosticPreferences.begin("diagcfg", false)) {
+    diagnosticPreferences.putBool("verbose", enabled);
+    diagnosticPreferences.end();
+  }
+}
+
+void clearVerboseRecords() {
+  portENTER_CRITICAL(&diagnosticMux);
+  diagnosticRecordHead = 0;
+  diagnosticRecordCount = 0;
+  diagnosticClearCount++;
+  portEXIT_CRITICAL(&diagnosticMux);
+  addEvent("INFO", "Verbose diagnostic buffer cleared");
+}
+
+void printVerboseStatus() {
+  uint16_t count;
+  uint32_t total, overwritten, clears;
+  portENTER_CRITICAL(&diagnosticMux);
+  count = diagnosticRecordCount;
+  total = diagnosticRecordsTotal;
+  overwritten = diagnosticRecordsOverwritten;
+  clears = diagnosticClearCount;
+  portEXIT_CRITICAL(&diagnosticMux);
+  Serial.println();
+  Serial.println(F("VERBOSE DIAGNOSTIC RECORDER"));
+  Serial.println(F("---------------------------"));
+  Serial.print(F("State:                 "));
+  Serial.println(!verboseLoggingEnabled ? F("DISABLED") :
+                 (verboseLoggingFrozen ? F("FROZEN") : F("RECORDING")));
+  Serial.print(F("Records retained:      ")); Serial.print(count);
+  Serial.print('/'); Serial.println(DIAG_RECORD_CAPACITY);
+  Serial.print(F("Records total:         ")); Serial.println(total);
+  Serial.print(F("Records overwritten:   ")); Serial.println(overwritten);
+  Serial.print(F("Buffer clears:         ")); Serial.println(clears);
+  Serial.print(F("Buffer memory:         ")); Serial.print(sizeof(diagnosticRecords)); Serial.println(F(" bytes"));
+  Serial.print(F("Sample interval:       ")); Serial.print(diagnosticSampleIntervalMs); Serial.println(F(" ms"));
+  Serial.print(F("Loop event threshold:  ")); Serial.print(loopDiagnosticThresholdMs); Serial.println(F(" ms"));
+  Serial.print(F("Format version:        ")); Serial.println(DIAG_RECORD_FORMAT_VERSION);
+  Serial.print(F("Record cost last/max:  ")); Serial.print(diagnosticLastRecordCostUs);
+  Serial.print(F(" / ")); Serial.print(diagnosticMaxRecordCostUs); Serial.println(F(" us"));
+  Serial.print(F("Sample cost last/max:  ")); Serial.print(diagnosticLastSampleCostUs);
+  Serial.print(F(" / ")); Serial.print(diagnosticMaxSampleCostUs); Serial.println(F(" us"));
+  Serial.println();
+}
+
+String makeVerboseStatusJson() {
+  uint16_t count;
+  uint32_t total, overwritten, clears;
+  portENTER_CRITICAL(&diagnosticMux);
+  count = diagnosticRecordCount;
+  total = diagnosticRecordsTotal;
+  overwritten = diagnosticRecordsOverwritten;
+  clears = diagnosticClearCount;
+  portEXIT_CRITICAL(&diagnosticMux);
+  String json = "{\"enabled\":" + String(verboseLoggingEnabled ? "true" : "false");
+  json += ",\"frozen\":" + String(verboseLoggingFrozen ? "true" : "false");
+  json += ",\"records\":" + String(count);
+  json += ",\"capacity\":" + String(DIAG_RECORD_CAPACITY);
+  json += ",\"total\":" + String(total);
+  json += ",\"overwritten\":" + String(overwritten);
+  json += ",\"clears\":" + String(clears);
+  json += ",\"recordSize\":" + String(sizeof(DiagnosticRecord));
+  json += ",\"bufferBytes\":" + String(sizeof(diagnosticRecords));
+  json += ",\"sampleIntervalMs\":" + String(diagnosticSampleIntervalMs);
+  json += ",\"slowSampleIntervalMs\":" + String(DIAG_SLOW_SAMPLE_INTERVAL_MS);
+  json += ",\"loopThresholdMs\":" + String(loopDiagnosticThresholdMs);
+  json += ",\"formatVersion\":" + String(DIAG_RECORD_FORMAT_VERSION);
+  json += ",\"lastRecordCostUs\":" + String(diagnosticLastRecordCostUs);
+  json += ",\"maxRecordCostUs\":" + String(diagnosticMaxRecordCostUs);
+  json += ",\"lastSampleCostUs\":" + String(diagnosticLastSampleCostUs);
+  json += ",\"maxSampleCostUs\":" + String(diagnosticMaxSampleCostUs) + "}";
+  return json;
 }
 
 // -----------------------------------------------------------------------------
 // Diagnostic event history
+// -----------------------------------------------------------------------------
 // -----------------------------------------------------------------------------
 
 void addEvent(const char *severity, const char *message) {
@@ -707,6 +1157,10 @@ void addEvent(const char *severity, const char *message) {
 
   eventHead = (eventHead + 1) % EVENT_HISTORY_SIZE;
   if (eventCount < EVENT_HISTORY_SIZE) eventCount++;
+  uint32_t severityCode = !strcmp(severity, "ERROR") ? 3 :
+                          !strcmp(severity, "WARN") ? 2 : 1;
+  recordDiagnostic(DIAG_ID_EVENT_HASH, DIAG_TYPE_EVENT,
+                   diagnosticStringHash(message), severityCode);
 }
 
 void printEvents() {
@@ -772,12 +1226,16 @@ void addLoopTimingEvent() {
   loopEventHead = (loopEventHead + 1) % LOOP_EVENT_HISTORY_SIZE;
   if (loopEventCount < LOOP_EVENT_HISTORY_SIZE) loopEventCount++;
   loopTimingEventCount++;
+  recordDiagnostic(DIAG_ID_LOOP_GAP_US, DIAG_TYPE_U32, loopLastGapUs, httpLastStatusCode);
+  recordDiagnostic(DIAG_ID_LOOP_DURATION_US, DIAG_TYPE_U32, loopLastDurationUs,
+                   diagnosticStringHash(httpLastRoute));
 }
 
 void printLoopEvents() {
   Serial.println();
-  Serial.println(F("RECENT LOOP TIMING EVENTS (threshold 100 ms)"));
-  Serial.println(F("--------------------------------------------"));
+  Serial.printf("RECENT LOOP TIMING EVENTS (threshold %lu ms)\n",
+                (unsigned long)loopDiagnosticThresholdMs);
+  Serial.println(F("------------------------------------------------"));
   if (!loopEventCount) {
     Serial.println(F("No loop timing events recorded."));
     return;
@@ -839,12 +1297,13 @@ void initializeFaultSystem() {
     faultBootId = previousBootId + 1;
     if (faultBootId == 0) faultBootId = 1;
     faultBootIdPersistent = diagnosticPreferences.putUInt("bootId", faultBootId) > 0;
+    verboseLoggingEnabled = diagnosticPreferences.getBool("verbose", false);
+    loopDiagnosticThresholdMs = constrain(diagnosticPreferences.getUInt("loopMs", 100), DIAG_MIN_LOOP_THRESHOLD_MS, DIAG_MAX_LOOP_THRESHOLD_MS);
+    diagnosticSampleIntervalMs = constrain(diagnosticPreferences.getUInt("diagMs", DIAG_DEFAULT_SAMPLE_INTERVAL_MS), DIAG_MIN_SAMPLE_INTERVAL_MS, DIAG_MAX_SAMPLE_INTERVAL_MS);
     diagnosticPreferences.end();
   }
 
   if (!faultBootIdPersistent) {
-    // A random session identifier still distinguishes this boot when NVS is
-    // unavailable, although it is not a persistent sequential boot counter.
     faultBootId = esp_random();
     if (faultBootId == 0) faultBootId = 1;
     addEvent("WARN", "Persistent diagnostic boot ID unavailable; using random session ID");
@@ -911,6 +1370,7 @@ void setFault(FaultId id, const char *subsystem, uint16_t code, const char *desc
   snprintf(fault.subsystem, sizeof(fault.subsystem), "%s", subsystem);
   snprintf(fault.description, sizeof(fault.description), "%s", description);
   enqueueFaultEvent(subsystem, "FAULT_ACTIVE", code, description);
+  recordDiagnostic(DIAG_ID_FAULT_STATE, DIAG_TYPE_EVENT, code, id, 1);
   addEvent("ERROR", description);
 }
 
@@ -919,6 +1379,7 @@ void clearFault(FaultId id, const char *description) {
 
   ActiveFault &fault = activeFaults[id];
   enqueueFaultEvent(fault.subsystem, "RECOVERED", fault.code, description);
+  recordDiagnostic(DIAG_ID_FAULT_STATE, DIAG_TYPE_EVENT, fault.code, id, 0);
   addEvent("INFO", description);
   fault.active = false;
   fault.code = 0;
@@ -1647,6 +2108,9 @@ void serviceCANLogger() {
   if (canLogLastWriteMs > canLogMaxWriteMs) canLogMaxWriteMs = canLogLastWriteMs;
   canLogWriteOperations++;
   canLogLastBatchRecords = count;
+  recordDiagnostic(DIAG_ID_CAN_LOG_WRITE_MS, DIAG_TYPE_U32, canLogLastWriteMs, count);
+  recordDiagnostic(DIAG_ID_CAN_LOG_BATCH_RECORDS, DIAG_TYPE_U32, count,
+                   canLogQueue ? uxQueueMessagesWaiting(canLogQueue) : 0);
   if (bytesWritten == bytesExpected) {
     canLogFramesWritten += count;
   } else {
@@ -2514,10 +2978,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V07 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V08 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V07 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V08 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -2557,6 +3021,8 @@ bool runSDTest() {
   if (sdLastWriteDurationMs > sdMaxWriteDurationMs) {
     sdMaxWriteDurationMs = sdLastWriteDurationMs;
   }
+  recordDiagnostic(DIAG_ID_SD_WRITE_DURATION_MS, DIAG_TYPE_U32,
+                   sdLastWriteDurationMs, sdWriteOperations);
 
   if (firstBytes == 0) {
     sdWriteFailures++;
@@ -2582,6 +3048,8 @@ bool runSDTest() {
   if (appendDurationMs > sdMaxWriteDurationMs) {
     sdMaxWriteDurationMs = appendDurationMs;
   }
+  recordDiagnostic(DIAG_ID_SD_WRITE_DURATION_MS, DIAG_TYPE_U32,
+                   appendDurationMs, sdWriteOperations);
 
   if (secondBytes == 0) {
     sdWriteFailures++;
@@ -2611,6 +3079,8 @@ bool runSDTest() {
   if (sdLastReadDurationMs > sdMaxReadDurationMs) {
     sdMaxReadDurationMs = sdLastReadDurationMs;
   }
+  recordDiagnostic(DIAG_ID_SD_READ_DURATION_MS, DIAG_TYPE_U32,
+                   sdLastReadDurationMs, sdReadOperations);
 
   bool firstFound = contents.indexOf(firstRecord) >= 0;
   bool secondFound = contents.indexOf(secondRecord) >= 0;
@@ -2672,6 +3142,13 @@ void configureWebServer() {
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
+  server.on("/api/verbose", HTTP_GET, handleVerboseStatus);
+  server.on("/api/verbose/start", HTTP_POST, handleVerboseStart);
+  server.on("/api/verbose/stop", HTTP_POST, handleVerboseStop);
+  server.on("/api/verbose/clear", HTTP_POST, handleVerboseClear);
+  server.on("/api/verbose/freeze", HTTP_POST, handleVerboseFreeze);
+  server.on("/api/verbose/resume", HTTP_POST, handleVerboseResume);
+  server.on("/download-verbose", HTTP_GET, handleVerboseDownload);
   server.on("/api/faults", HTTP_GET, handleFaults);
   server.on("/api/files", HTTP_GET, handleFileList);
   server.on("/api/file", HTTP_GET, handleFileView);
@@ -2701,6 +3178,10 @@ void recordHttp(const char *method, const char *route, uint32_t startUs, uint16_
     httpMaxStatusCode = statusCode;
   }
 
+  recordDiagnostic(DIAG_ID_HTTP_HANDLER_US, DIAG_TYPE_U32, duration, statusCode);
+  recordDiagnostic(DIAG_ID_HTTP_ROUTE_HASH, DIAG_TYPE_EVENT,
+                   diagnosticStringHash(route),
+                   !strcmp(method, "POST") ? 2 : 1);
   if (statusCode >= 400) {
     httpErrorResponses++;
     addHttpError(method, route, statusCode);
@@ -2817,6 +3298,104 @@ void handleLoopEvents() {
   String json = makeLoopEventsJson();
   sendHttpResponse(200, "application/json", json);
   recordHttp("GET", "/api/loop-events", startUs, 200);
+}
+
+void handleVerboseStatus() {
+  uint32_t started = micros();
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("GET", "/api/verbose", started, 200);
+}
+
+void handleVerboseStart() {
+  uint32_t started = micros();
+  setVerboseLogging(true);
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("POST", "/api/verbose/start", started, 200);
+}
+
+void handleVerboseStop() {
+  uint32_t started = micros();
+  setVerboseLogging(false);
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("POST", "/api/verbose/stop", started, 200);
+}
+
+void handleVerboseClear() {
+  uint32_t started = micros();
+  clearVerboseRecords();
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("POST", "/api/verbose/clear", started, 200);
+}
+
+void handleVerboseFreeze() {
+  uint32_t started = micros();
+  addEvent("INFO", "Verbose diagnostic buffer frozen");
+  verboseLoggingFrozen = true;
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("POST", "/api/verbose/freeze", started, 200);
+}
+
+void handleVerboseResume() {
+  uint32_t started = micros();
+  setVerboseLogging(true);
+  sendHttpResponse(200, "application/json", makeVerboseStatusJson());
+  recordHttp("POST", "/api/verbose/resume", started, 200);
+}
+
+void handleVerboseDownload() {
+  uint32_t started = micros();
+  if (canLoggingActive || canLoggingStopping) {
+    sendHttpResponse(409, "application/json",
+                     "{\"error\":\"Stop CAN capture before downloading verbose diagnostics.\"}");
+    recordHttp("GET", "/download-verbose", started, 409);
+    return;
+  }
+  uint16_t snapshotHead;
+  uint16_t snapshotCount;
+  portENTER_CRITICAL(&diagnosticMux);
+  snapshotHead = diagnosticRecordHead;
+  snapshotCount = diagnosticRecordCount;
+  portEXIT_CRITICAL(&diagnosticMux);
+
+  server.sendHeader("Content-Disposition", "attachment; filename=DIAG_VERBOSE.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  char metadata[128];
+  snprintf(metadata, sizeof(metadata),
+           "# diagnostic_format_version=%u,record_size=%u,boot_id=%lu,timestamp=esp_timer_get_time_us_since_boot\r\n",
+           (unsigned)DIAG_RECORD_FORMAT_VERSION, (unsigned)sizeof(DiagnosticRecord),
+           (unsigned long)faultBootId);
+  server.sendContent(metadata);
+  server.sendContent("timestamp_us,record_id,name,type,value,context,flags,detail\r\n");
+
+  String chunk;
+  chunk.reserve(768);
+  uint16_t first = (snapshotHead + DIAG_RECORD_CAPACITY - snapshotCount) % DIAG_RECORD_CAPACITY;
+  for (uint16_t i = 0; i < snapshotCount; i++) {
+    DiagnosticRecord record;
+    portENTER_CRITICAL(&diagnosticMux);
+    record = diagnosticRecords[(first + i) % DIAG_RECORD_CAPACITY];
+    portEXIT_CRITICAL(&diagnosticMux);
+
+    chunk += String((unsigned long long)record.timestampUs);
+    chunk += ","; chunk += String(record.recordId);
+    chunk += ","; chunk += diagnosticRecordName(record.recordId);
+    chunk += ","; chunk += diagnosticRecordTypeName(record.dataType);
+    chunk += ",";
+    if (record.dataType == DIAG_TYPE_I32) chunk += String((long)(int32_t)record.value);
+    else chunk += String((unsigned long)record.value);
+    chunk += ","; chunk += String((unsigned long)record.context);
+    chunk += ","; chunk += String(record.flags);
+    chunk += ",\""; chunk += diagnosticRecordDetail(record); chunk += "\"";
+    chunk += "\r\n";
+    if (chunk.length() >= 640) {
+      server.sendContent(chunk);
+      chunk = "";
+    }
+  }
+  if (chunk.length()) server.sendContent(chunk);
+  server.sendContent("");
+  recordHttp("GET", "/download-verbose", started, 200);
 }
 
 // -----------------------------------------------------------------------------
@@ -3081,6 +3660,7 @@ String makeStatusJson() {
   json += "\"loopLastGapUs\":" + String(loopLastGapUs) + ",";
   json += "\"loopMaxGapUs\":" + String(loopMaxGapUs) + ",";
   json += "\"loopTimingEventCount\":" + String(loopTimingEventCount) + ",";
+  json += "\"loopDiagnosticThresholdMs\":" + String(loopDiagnosticThresholdMs) + ",";
   json += "\"loopEventHistoryCount\":" + String(loopEventCount) + ",";
   json += "\"eventCount\":" + String(eventCount) + ",";
   json += "\"bootCheckpointCount\":" + String(bootCheckpointCount) + ",";
@@ -3198,7 +3778,7 @@ String makeLoopEventsJson() {
 
 String htmlPage() {
   String page;
-  page.reserve(18000);
+  page.reserve(32000);
 
   page += R"rawliteral(
 <!DOCTYPE html>
@@ -3235,7 +3815,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V07</p>
+<p class="sub">System dashboard - V08</p>
 
 <div class="grid">
   <section class="card">
@@ -3359,6 +3939,27 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 </div>
 
 <section class="card">
+  <h2>Verbose diagnostic recording</h2>
+  <div class="row"><span>Recorder state</span><span class="value" id="verboseState">--</span></div>
+  <div class="row"><span>Records retained / capacity</span><span class="value" id="verboseRecords">--</span></div>
+  <div class="row"><span>Total / overwritten</span><span class="value" id="verboseTotals">--</span></div>
+  <div class="row"><span>RAM allocation</span><span class="value" id="verboseMemory">--</span></div>
+  <div class="row"><span>Sample interval</span><span class="value" id="verboseInterval">--</span></div>
+  <div class="row"><span>Loop event threshold</span><span class="value" id="verboseThreshold">--</span></div>
+  <div class="row"><span>Recorder last / max cost</span><span class="value" id="verboseRecordCost">--</span></div>
+  <div class="row"><span>Sample last / max cost</span><span class="value" id="verboseSampleCost">--</span></div>
+  <button onclick="startVerbose()">Start recording</button>
+  <button class="secondary" onclick="stopVerbose()">Stop</button>
+  <button class="secondary" onclick="freezeVerbose()">Freeze buffer</button>
+  <button class="secondary" onclick="resumeVerbose()">Resume</button>
+  <button class="secondary" onclick="clearVerbose()">Clear buffer</button>
+  <button class="secondary" onclick="refreshVerbose()">Refresh status</button>
+  <a href="/download-verbose">Download diagnostic CSV</a>
+  <p class="small muted">RAM-only circular recording. Enabled state is retained across reboot. Oldest records are overwritten when the buffer fills. Stop CAN capture before downloading diagnostics; CAN frames remain in the separate binary capture.</p>
+  <div id="verboseMessage" class="small muted"></div>
+</section>
+
+<section class="card">
   <h2>CAN capture</h2>
   <div class="row"><span>Capture state</span><span class="value" id="logState">--</span></div>
   <div class="row"><span>Current file</span><span class="value" id="logFile">--</span></div>
@@ -3411,7 +4012,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
   <div id="events" class="small muted">Loading...</div>
 </section>
 
-<p class="small muted">Status refresh interval: 5 seconds. Loop timing events are retained when a loop gap or duration reaches 100 ms. CAN/TWAI runs at 250 kbit/s in listen-only mode. V07 receives frames in a dedicated task and writes versioned binary captures to /diag using a bounded queue.</p>
+<p class="small muted">Dashboard status refresh interval: 5 seconds. Loop timing event threshold defaults to 100 ms and is configurable over Serial. Verbose diagnostic recording uses a bounded RAM circular buffer and can be enabled independently of browser navigation. CAN/TWAI remains at 250 kbit/s in listen-only mode; CAN frames are received in a dedicated task and written to versioned binary captures under /diag using a bounded queue.</p>
 </main>
 
 <script>
@@ -3528,6 +4129,34 @@ async function refreshCanFrames(){
     host.style.whiteSpace='pre-wrap';
   }catch(e){host.textContent='CAN frame history unavailable: '+e.message;}
 }
+
+async function refreshVerbose(){
+  try{
+    const s=await fetchJson('/api/verbose');
+    setText('verboseState',!s.enabled?'DISABLED':(s.frozen?'FROZEN':'RECORDING'));
+    setText('verboseRecords',s.records+' / '+s.capacity);
+    setText('verboseTotals',s.total+' / '+s.overwritten);
+    setText('verboseMemory',s.bufferBytes+' bytes');
+    setText('verboseInterval',s.sampleIntervalMs+' ms');
+    setText('verboseThreshold',s.loopThresholdMs+' ms');
+    setText('verboseRecordCost',s.lastRecordCostUs+' / '+s.maxRecordCostUs+' us');
+    setText('verboseSampleCost',s.lastSampleCostUs+' / '+s.maxSampleCostUs+' us');
+  }catch(e){setText('verboseState','Unavailable: '+e.message);}
+}
+async function verboseAction(path,description){
+  try{
+    const r=await fetch(path,{method:'POST'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const s=await r.json();
+    setText('verboseMessage',description+'; '+s.records+' records retained.');
+    await refreshVerbose();
+  }catch(e){setText('verboseMessage','Verbose recorder request failed: '+e.message);}
+}
+function startVerbose(){verboseAction('/api/verbose/start','Recording enabled');}
+function stopVerbose(){verboseAction('/api/verbose/stop','Recording disabled');}
+function freezeVerbose(){verboseAction('/api/verbose/freeze','Buffer frozen');}
+function resumeVerbose(){verboseAction('/api/verbose/resume','Recording resumed');}
+function clearVerbose(){if(confirm('Clear the retained verbose diagnostic records?'))verboseAction('/api/verbose/clear','Buffer cleared');}
 
 async function refreshStatus(){
   try{
@@ -3677,6 +4306,7 @@ refreshLoopEvents();
 refreshCanFrames();
 refreshFiles();
 refreshLogging();
+refreshVerbose();
 setInterval(refreshStatus,5000);
 setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
@@ -3764,6 +4394,58 @@ void processSerialCommand(char *command) {
     printLoopEvents();
   } else if (!strcmp(command, "checkpoints")) {
     printBootCheckpoints();
+  } else if (!strcmp(command, "verbose status")) {
+    printVerboseStatus();
+  } else if (!strcmp(command, "verbose on")) {
+    setVerboseLogging(true);
+    printVerboseStatus();
+  } else if (!strcmp(command, "verbose off")) {
+    setVerboseLogging(false);
+    printVerboseStatus();
+  } else if (!strcmp(command, "verbose freeze")) {
+    addEvent("INFO", "Verbose diagnostic buffer frozen");
+    verboseLoggingFrozen = true;
+    printVerboseStatus();
+  } else if (!strcmp(command, "verbose resume")) {
+    setVerboseLogging(true);
+    printVerboseStatus();
+  } else if (!strcmp(command, "verbose clear")) {
+    clearVerboseRecords();
+    printVerboseStatus();
+  } else if (!strncmp(command, "verbose interval ", 17)) {
+    uint32_t value = (uint32_t)strtoul(command + 17, nullptr, 10);
+    if (value < DIAG_MIN_SAMPLE_INTERVAL_MS || value > DIAG_MAX_SAMPLE_INTERVAL_MS) {
+      Serial.printf("[VERBOSE] Interval must be %lu-%lu ms.\n",
+                    (unsigned long)DIAG_MIN_SAMPLE_INTERVAL_MS,
+                    (unsigned long)DIAG_MAX_SAMPLE_INTERVAL_MS);
+    } else {
+      diagnosticSampleIntervalMs = value;
+      diagnosticLastSampleMs = 0;
+      if (diagnosticPreferences.begin("diagcfg", false)) {
+        diagnosticPreferences.putUInt("diagMs", value);
+        diagnosticPreferences.end();
+      }
+      printVerboseStatus();
+    }
+  } else if (!strcmp(command, "diag threshold") || !strcmp(command, "diag threshold status")) {
+    Serial.printf("[DIAG] Loop timing threshold: %lu ms (range %lu-%lu).\n",
+                  (unsigned long)loopDiagnosticThresholdMs,
+                  (unsigned long)DIAG_MIN_LOOP_THRESHOLD_MS,
+                  (unsigned long)DIAG_MAX_LOOP_THRESHOLD_MS);
+  } else if (!strncmp(command, "diag threshold ", 15)) {
+    uint32_t value = (uint32_t)strtoul(command + 15, nullptr, 10);
+    if (value < DIAG_MIN_LOOP_THRESHOLD_MS || value > DIAG_MAX_LOOP_THRESHOLD_MS) {
+      Serial.printf("[DIAG] Threshold must be %lu-%lu ms.\n",
+                    (unsigned long)DIAG_MIN_LOOP_THRESHOLD_MS,
+                    (unsigned long)DIAG_MAX_LOOP_THRESHOLD_MS);
+    } else {
+      loopDiagnosticThresholdMs = value;
+      if (diagnosticPreferences.begin("diagcfg", false)) {
+        diagnosticPreferences.putUInt("loopMs", value);
+        diagnosticPreferences.end();
+      }
+      Serial.printf("[DIAG] Loop timing threshold set to %lu ms.\n", (unsigned long)value);
+    }
   } else if (!strcmp(command, "log status")) {
     printCANLoggingStatus();
   } else if (!strcmp(command, "log start")) {
@@ -3867,8 +4549,14 @@ void printHelp() {
   Serial.println(F("faults                       Active faults and recent fault/recovery events"));
   Serial.println(F("faults clear                 Clear RAM history; preserve active/pending/persistent faults"));
   Serial.println(F("httperrors                   Recent HTTP 4xx/5xx requests"));
-  Serial.println(F("loopevents                   Recent loop timing anomalies (>=100 ms)"));
+  Serial.println(F("loopevents                   Recent loop timing anomalies (configured threshold)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
+  Serial.println(F("verbose status               Verbose recorder status"));
+  Serial.println(F("verbose on/off               Enable/disable RAM diagnostic recording"));
+  Serial.println(F("verbose freeze/resume        Freeze/resume the RAM record buffer"));
+  Serial.println(F("verbose clear                Clear retained RAM records"));
+  Serial.println(F("verbose interval <ms>        Set sample interval (250-10000 ms)"));
+  Serial.println(F("diag threshold [ms]          Show/set loop event threshold (10-1000 ms)"));
   Serial.println(F("can                          Show the 16 most recent CAN frames"));
   Serial.println(F("can frames [count]           Show 1-32 recent CAN frames"));
   Serial.println(F("log start                    Start a new binary CAN capture"));
@@ -3889,7 +4577,8 @@ void printHelp() {
   Serial.println(F("wifi forget                  Erase saved infrastructure credentials"));
   Serial.println();
   Serial.println(F("SD file inspection is read-only and restricted to /diag."));
-  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; V07 supports binary CAN capture to /diag."));
+  Serial.println(F("CAN/TWAI is fixed at 250 kbit/s, listen-only; binary CAN capture is stored under /diag."));
+  Serial.println(F("Verbose diagnostics are RAM-only; enable with 'verbose on'."));
   Serial.println(F("AP remains enabled as a recovery interface."));
   Serial.println(F("Wi-Fi password is never printed."));
   Serial.println();
