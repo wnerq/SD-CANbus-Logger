@@ -1,12 +1,16 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V08d
+  Firmware: V08e
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V08c purpose:
+  V08c purpose (retained in V08e):
+    - Cache immutable device/build information at startup; remove expensive
+      device-information queries from recurring status requests.
+    - Cache SD card/filesystem metadata on mount and after SD mutations or
+      capture finalization rather than refreshing it on every status request.
     - Add a bounded, versioned RAM diagnostic recorder independent of browser navigation.
     - Record periodic subsystem samples and significant diagnostic events.
     - Provide serial and browser controls, status, and CSV export.
@@ -128,7 +132,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V08d";
+static const char FIRMWARE_VERSION[] = "V08e";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -331,7 +335,7 @@ uint8_t loopEventCount = 0;
 uint32_t loopTimingEventCount = 0;
 
 // -----------------------------------------------------------------------------
-// V08c verbose diagnostic recorder
+// V08e cached system information and V08c verbose diagnostic recorder
 // -----------------------------------------------------------------------------
 
 static const uint16_t DIAG_RECORD_CAPACITY = 512;
@@ -550,6 +554,23 @@ uint64_t sdCardCapacityBytes = 0;
 uint64_t sdTotalBytes = 0;
 uint64_t sdUsedBytes = 0;
 
+// Immutable or boot-stable system information. Initialized once during setup.
+struct SystemInfoCache {
+  bool initialized = false;
+  String arduinoCoreVersion;
+  String espIdfVersion;
+  String chipModel;
+  String resetReason;
+  String apMac;
+  String staMac;
+  uint32_t chipRevision = 0;
+  uint32_t cpuMHz = 0;
+  uint32_t flashChipSize = 0;
+  uint32_t sketchSize = 0;
+  uint32_t freeSketchSpace = 0;
+};
+SystemInfoCache systemInfo;
+
 uint32_t bootMillis = 0;
 uint32_t staAttemptStartedMs = 0;
 uint32_t nextStaRetryMs = 0;
@@ -720,6 +741,7 @@ void printCANFrames(uint8_t requestedCount);
 String makeCANFramesJson();
 const char *getCANStateText();
 void refreshSDInformation(StatusJsonTimings *timings = nullptr);
+void refreshSDUsageInformation();
 bool runSDTest();
 
 void configureWebServer();
@@ -749,6 +771,8 @@ void printStatus();
 String formatUptime(uint32_t milliseconds);
 String getResetReasonText();
 String getArduinoCoreVersion();
+void initializeSystemInfoCache();
+void initializeSystemNetworkIdentityCache();
 String jsonEscape(const String &value);
 String getSystemHealth();
 String getSystemHealthDetails();
@@ -764,6 +788,7 @@ void sendHttpResponse(int statusCode, const char *contentType, const String &bod
 void setup() {
   Serial.begin(115200);
   bootMillis = millis();
+  initializeSystemInfoCache();
   initializeLed();
   delay(500);
 
@@ -777,11 +802,11 @@ void setup() {
   Serial.print(F("Build:    "));
   Serial.println(BUILD_LABEL);
   Serial.print(F("Reset:    "));
-  Serial.println(getResetReasonText());
+  Serial.println(systemInfo.resetReason);
   Serial.println();
 
   initializeFaultSystem();
-  recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 8, ESP.getChipRevision());
+  recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 8, systemInfo.chipRevision);
   addEvent("INFO", "System startup");
   captureBootCheckpoint("Startup");
 
@@ -798,6 +823,7 @@ void setup() {
 
   // Start AP first so a recovery/configuration interface is always available.
   startWiFi();
+  initializeSystemNetworkIdentityCache();
   captureBootCheckpoint("Wi-Fi AP started");
 
 WiFi.onEvent(
@@ -1024,7 +1050,7 @@ const char *diagnosticRecordDetail(const DiagnosticRecord &record) {
       default: return "stopped";
     }
   }
-  if (record.recordId == DIAG_ID_BOOT) return "firmware V08c boot/enable marker";
+  if (record.recordId == DIAG_ID_BOOT) return "firmware V08e boot/enable marker";
   return "";
 }
 
@@ -1490,6 +1516,7 @@ bool initializeFaultLogFile() {
     file.flush();
   }
   file.close();
+  if (ok) refreshSDUsageInformation();
   return ok;
 }
 
@@ -1517,6 +1544,7 @@ bool writeFaultEvent(const FaultEventRecord &record) {
   ok = ok && newlineBytes > 0;
   file.flush();
   file.close();
+  if (ok) refreshSDUsageInformation();
   return ok;
 }
 
@@ -2164,6 +2192,7 @@ bool startCANLogging() {
   portEXIT_CRITICAL(&canMux);
   canLogFilesCreated++;
   sdOperationActive = false;
+  refreshSDUsageInformation();
   addEvent("INFO", "CAN binary capture started");
   Serial.print(F("[CAN LOG] Capture started: ")); Serial.println(canLogCurrentPath);
   return true;
@@ -2246,6 +2275,7 @@ bool stopCANLogging(bool reportResult) {
   canLogFileOpen = false;
   canLoggingStopping = false;
   sdOperationActive = false;
+  refreshSDUsageInformation();
   addEvent("INFO", "CAN binary capture stopped and file closed");
   if (reportResult) {
     Serial.print(F("[CAN LOG] Capture finalized: ")); Serial.println(canLogCurrentPath);
@@ -2893,7 +2923,7 @@ void printWiFiStatus() {
   Serial.print(F("AP clients:           "));
   Serial.println(WiFi.softAPgetStationNum());
   Serial.print(F("AP MAC:               "));
-  Serial.println(WiFi.softAPmacAddress());
+  Serial.println(systemInfo.apMac);
   Serial.print(F("STA configured:       "));
   Serial.println(configuredStaSsid.length() ? F("YES") : F("NO"));
   Serial.print(F("STA SSID:             "));
@@ -2914,7 +2944,7 @@ void printWiFiStatus() {
     Serial.println(F("N/A"));
   }
   Serial.print(F("STA MAC:              "));
-  Serial.println(WiFi.macAddress());
+  Serial.println(systemInfo.staMac);
   Serial.print(F("STA attempts:         "));
   Serial.println(staConnectAttempts);
   Serial.print(F("STA disconnects:      "));
@@ -2959,6 +2989,10 @@ void initializeSDCard() {
     runSDTest();
   } else {
     sdReady = false;
+    sdCardTypeText = "Unavailable";
+    sdCardCapacityBytes = 0;
+    sdTotalBytes = 0;
+    sdUsedBytes = 0;
     sdMountFailures++;
     sdLastResult = "Card mount failed";
     setFault(FAULT_SD_MOUNT, "SD", 1, "SD card mount failed");
@@ -2993,6 +3027,7 @@ void remountSDCard() {
   }
   SD.end();
   sdReady = false;
+  sdCardTypeText = "Unavailable";
   sdTestPassed = false;
   faultLogReady = false;
   sdCardCapacityBytes = 0;
@@ -3033,6 +3068,13 @@ void refreshSDInformation(StatusJsonTimings *timings) {
   if (timings) timings->sdUsedBytesUs = micros() - operationStartUs;
 }
 
+// Filesystem capacity is fixed for the mounted volume. Only used space needs
+// refreshing after operations that create or extend files.
+void refreshSDUsageInformation() {
+  if (!sdReady) return;
+  sdUsedBytes = SD.usedBytes();
+}
+
 // -----------------------------------------------------------------------------
 // SD write/append/readback diagnostic
 // -----------------------------------------------------------------------------
@@ -3067,10 +3109,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V08c - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V08e - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V08c - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V08e - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -3081,6 +3123,7 @@ bool runSDTest() {
     sdLastResult = reason;
     sdTestDurationMs = millis() - testStartMs;
     sdTestRunning = false;
+    refreshSDUsageInformation();
     setFault(FAULT_SD_TEST, "SD", 2, reason);
     addEvent("ERROR", reason);
     Serial.print(F("[SD TEST] FAIL: "));
@@ -3194,7 +3237,7 @@ bool runSDTest() {
     Serial.println(contents);
   }
 
-  refreshSDInformation();
+  refreshSDUsageInformation();
 
   Serial.print(F("[SD TEST] Duration: "));
   Serial.print(sdTestDurationMs);
@@ -3291,11 +3334,9 @@ void handleStatus() {
   httpStatusRequests++;
   StatusJsonTimings timings = {};
 
+  // SD metadata is cached at mount and after completed SD mutations. Do not
+  // interrogate the card/filesystem as part of a routine status refresh.
   uint32_t phaseStartUs = micros();
-  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation(&timings);
-  timings.sdRefreshUs = micros() - phaseStartUs;
-
-  phaseStartUs = micros();
   String json = makeStatusJson(&timings);
   // Includes String construction and all status JSON field generation.
   uint32_t jsonBuildElapsedUs = micros() - phaseStartUs;
@@ -3576,6 +3617,28 @@ String getArduinoCoreVersion() {
 #endif
 }
 
+void initializeSystemInfoCache() {
+  // These values are fixed for this boot. ESP.getSketchSize() is deliberately
+  // called here, not from makeStatusJson(), because it is unusually expensive
+  // on the installed Arduino-ESP32 core.
+  systemInfo.arduinoCoreVersion = getArduinoCoreVersion();
+  systemInfo.espIdfVersion = ESP.getSdkVersion();
+  systemInfo.chipModel = ESP.getChipModel();
+  systemInfo.chipRevision = ESP.getChipRevision();
+  systemInfo.cpuMHz = ESP.getCpuFreqMHz();
+  systemInfo.flashChipSize = ESP.getFlashChipSize();
+  systemInfo.sketchSize = ESP.getSketchSize();
+  systemInfo.freeSketchSpace = ESP.getFreeSketchSpace();
+  systemInfo.resetReason = getResetReasonText();
+  systemInfo.initialized = true;
+}
+
+void initializeSystemNetworkIdentityCache() {
+  // The AP must be started before its MAC address can be queried.
+  systemInfo.apMac = WiFi.softAPmacAddress();
+  systemInfo.staMac = WiFi.macAddress();
+}
+
 String jsonEscape(const String &value) {
   String escaped;
   escaped.reserve(value.length() + 8);
@@ -3702,73 +3765,20 @@ String makeStatusJson(StatusJsonTimings *timings) {
 
   {
     if (timings) systemOperationStartUs = micros();
-    String arduinoCoreVersion = getArduinoCoreVersion();
-    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
-    json += "\"arduinoCore\":\"" + jsonEscape(arduinoCoreVersion) + "\",";
+    json += "\"arduinoCore\":\"" + jsonEscape(systemInfo.arduinoCoreVersion) + "\",";
   }
 
   {
     if (timings) systemOperationStartUs = micros();
-    String espIdfVersion = ESP.getSdkVersion();
-    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
-    json += "\"espIdf\":\"" + jsonEscape(espIdfVersion) + "\",";
+    json += "\"espIdf\":\"" + jsonEscape(systemInfo.espIdfVersion) + "\",";
   }
 
-  {
-    if (timings) systemOperationStartUs = micros();
-    String chipModel = ESP.getChipModel();
-    if (timings) {
-      uint32_t elapsedUs = micros() - systemOperationStartUs;
-      timings->systemChipModelUs += elapsedUs;
-      timings->systemDeviceUs += elapsedUs;
-    }
-    json += "\"chip\":\"" + jsonEscape(chipModel) + "\",";
-  }
-
-  if (timings) systemOperationStartUs = micros();
-  uint32_t chipRevision = ESP.getChipRevision();
-  if (timings) {
-    uint32_t elapsedUs = micros() - systemOperationStartUs;
-    timings->systemChipRevisionUs += elapsedUs;
-    timings->systemDeviceUs += elapsedUs;
-  }
-  json += "\"chipRevision\":" + String(chipRevision) + ",";
-
-  if (timings) systemOperationStartUs = micros();
-  uint32_t cpuMHz = ESP.getCpuFreqMHz();
-  if (timings) {
-    uint32_t elapsedUs = micros() - systemOperationStartUs;
-    timings->systemCpuFreqUs += elapsedUs;
-    timings->systemDeviceUs += elapsedUs;
-  }
-  json += "\"cpuMHz\":" + String(cpuMHz) + ",";
-
-  if (timings) systemOperationStartUs = micros();
-  uint32_t flashChipSize = ESP.getFlashChipSize();
-  if (timings) {
-    uint32_t elapsedUs = micros() - systemOperationStartUs;
-    timings->systemFlashSizeUs += elapsedUs;
-    timings->systemDeviceUs += elapsedUs;
-  }
-  json += "\"flashMB\":" + String((double)flashChipSize / 1048576.0, 1) + ",";
-
-  if (timings) systemOperationStartUs = micros();
-  uint32_t sketchSize = ESP.getSketchSize();
-  if (timings) {
-    uint32_t elapsedUs = micros() - systemOperationStartUs;
-    timings->systemSketchSizeUs += elapsedUs;
-    timings->systemDeviceUs += elapsedUs;
-  }
-  json += "\"sketchKB\":" + String((double)sketchSize / 1024.0, 1) + ",";
-
-  if (timings) systemOperationStartUs = micros();
-  uint32_t freeSketchSpace = ESP.getFreeSketchSpace();
-  if (timings) {
-    uint32_t elapsedUs = micros() - systemOperationStartUs;
-    timings->systemFreeSketchUs += elapsedUs;
-    timings->systemDeviceUs += elapsedUs;
-  }
-  json += "\"freeSketchKB\":" + String((double)freeSketchSpace / 1024.0, 1) + ",";
+  json += "\"chip\":\"" + jsonEscape(systemInfo.chipModel) + "\",";
+  json += "\"chipRevision\":" + String(systemInfo.chipRevision) + ",";
+  json += "\"cpuMHz\":" + String(systemInfo.cpuMHz) + ",";
+  json += "\"flashMB\":" + String((double)systemInfo.flashChipSize / 1048576.0, 1) + ",";
+  json += "\"sketchKB\":" + String((double)systemInfo.sketchSize / 1024.0, 1) + ",";
+  json += "\"freeSketchKB\":" + String((double)systemInfo.freeSketchSpace / 1024.0, 1) + ",";
 
   json += "\"uptimeMs\":" + String(millis() - bootMillis) + ",";
   {
@@ -3780,9 +3790,7 @@ String makeStatusJson(StatusJsonTimings *timings) {
 
   {
     if (timings) systemOperationStartUs = micros();
-    String resetReasonText = getResetReasonText();
-    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
-    json += "\"resetReason\":\"" + resetReasonText + "\",";
+    json += "\"resetReason\":\"" + systemInfo.resetReason + "\",";
   }
 
   {
@@ -3825,7 +3833,7 @@ String makeStatusJson(StatusJsonTimings *timings) {
   json += (wifiApStarted ? "true" : "false");
   json += ",\"apSsid\":\"" + String(WIFI_AP_SSID) + "\",";
   json += "\"apIp\":\"" + WiFi.softAPIP().toString() + "\",";
-  json += "\"apMac\":\"" + WiFi.softAPmacAddress() + "\",";
+  json += "\"apMac\":\"" + systemInfo.apMac + "\",";
   json += "\"apClients\":" + String(WiFi.softAPgetStationNum()) + ",";
   json += "\"staConfigured\":";
   json += (configuredStaSsid.length() ? "true" : "false");
@@ -3840,7 +3848,7 @@ String makeStatusJson(StatusJsonTimings *timings) {
   json += "\"staConnecting\":" + String(wifiStaConnecting ? "true" : "false");
   json += ",\"staIp\":\"" + (wifiStaConnected ? WiFi.localIP().toString() : String("0.0.0.0")) + "\",";
   json += "\"staRssi\":" + String(wifiStaConnected ? WiFi.RSSI() : 0) + ",";
-  json += "\"staMac\":\"" + WiFi.macAddress() + "\",";
+  json += "\"staMac\":\"" + systemInfo.staMac + "\",";
   json += "\"staAttempts\":" + String(staConnectAttempts) + ",";
   json += "\"staDisconnects\":" + String(staDisconnectCount) + ",";
   json += "\"staLastDisconnectReason\":" + String(lastStaDisconnectReason) + ",";
@@ -4061,7 +4069,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V08c</p>
+<p class="sub">System dashboard - V08e</p>
 
 <div class="grid">
   <section class="card">
@@ -4831,8 +4839,6 @@ void printHelp() {
 }
 
 void printStatus() {
-  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation();
-
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   uint32_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -4844,16 +4850,16 @@ void printStatus() {
   Serial.print(F("Project:              ")); Serial.println(PROJECT_NAME);
   Serial.print(F("Firmware:             ")); Serial.println(FIRMWARE_VERSION);
   Serial.print(F("Build:                ")); Serial.println(BUILD_LABEL);
-  Serial.print(F("Arduino core:         ")); Serial.println(getArduinoCoreVersion());
-  Serial.print(F("ESP-IDF:              ")); Serial.println(ESP.getSdkVersion());
-  Serial.print(F("Chip:                 ")); Serial.println(ESP.getChipModel());
-  Serial.print(F("Chip revision:        ")); Serial.println(ESP.getChipRevision());
-  Serial.print(F("CPU frequency:        ")); Serial.print(ESP.getCpuFreqMHz()); Serial.println(F(" MHz"));
-  Serial.print(F("Flash capacity:       ")); Serial.print((double)ESP.getFlashChipSize() / 1048576.0, 1); Serial.println(F(" MB"));
-  Serial.print(F("Sketch size:          ")); Serial.print((double)ESP.getSketchSize() / 1024.0, 1); Serial.println(F(" KB"));
-  Serial.print(F("Free app space:       ")); Serial.print((double)ESP.getFreeSketchSpace() / 1024.0, 1); Serial.println(F(" KB"));
+  Serial.print(F("Arduino core:         ")); Serial.println(systemInfo.arduinoCoreVersion);
+  Serial.print(F("ESP-IDF:              ")); Serial.println(systemInfo.espIdfVersion);
+  Serial.print(F("Chip:                 ")); Serial.println(systemInfo.chipModel);
+  Serial.print(F("Chip revision:        ")); Serial.println(systemInfo.chipRevision);
+  Serial.print(F("CPU frequency:        ")); Serial.print(systemInfo.cpuMHz); Serial.println(F(" MHz"));
+  Serial.print(F("Flash capacity:       ")); Serial.print((double)systemInfo.flashChipSize / 1048576.0, 1); Serial.println(F(" MB"));
+  Serial.print(F("Sketch size:          ")); Serial.print((double)systemInfo.sketchSize / 1024.0, 1); Serial.println(F(" KB"));
+  Serial.print(F("Free app space:       ")); Serial.print((double)systemInfo.freeSketchSpace / 1024.0, 1); Serial.println(F(" KB"));
   Serial.print(F("Uptime:               ")); Serial.println(formatUptime(millis() - bootMillis));
-  Serial.print(F("Reset reason:         ")); Serial.println(getResetReasonText());
+  Serial.print(F("Reset reason:         ")); Serial.println(systemInfo.resetReason);
   Serial.print(F("System health:        ")); Serial.println(getSystemHealth());
   printSystemHealthDetails();
 
