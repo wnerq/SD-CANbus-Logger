@@ -1,12 +1,12 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V08
+  Firmware: V08d
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V08 purpose:
+  V08c purpose:
     - Add a bounded, versioned RAM diagnostic recorder independent of browser navigation.
     - Record periodic subsystem samples and significant diagnostic events.
     - Provide serial and browser controls, status, and CSV export.
@@ -128,7 +128,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V08";
+static const char FIRMWARE_VERSION[] = "V08d";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -331,7 +331,7 @@ uint8_t loopEventCount = 0;
 uint32_t loopTimingEventCount = 0;
 
 // -----------------------------------------------------------------------------
-// V08 verbose diagnostic recorder
+// V08c verbose diagnostic recorder
 // -----------------------------------------------------------------------------
 
 static const uint16_t DIAG_RECORD_CAPACITY = 512;
@@ -400,7 +400,32 @@ enum DiagnosticRecordId : uint16_t {
   DIAG_ID_CAN_LOG_FRAMES_WRITTEN,
   DIAG_ID_CAN_LOG_WRITE_FAILURES,
   DIAG_ID_CAN_LOG_LAST_WRITE_MS,
-  DIAG_ID_FAULT_QUEUE_DROPS
+  DIAG_ID_FAULT_QUEUE_DROPS,
+  DIAG_ID_STATUS_SD_REFRESH_US,
+  DIAG_ID_STATUS_SD_CARD_TYPE_US,
+  DIAG_ID_STATUS_SD_CARD_SIZE_US,
+  DIAG_ID_STATUS_SD_TOTAL_BYTES_US,
+  DIAG_ID_STATUS_SD_USED_BYTES_US,
+  DIAG_ID_STATUS_SYSTEM_MEMORY_US,
+  DIAG_ID_STATUS_WIFI_US,
+  DIAG_ID_STATUS_SD_JSON_US,
+  DIAG_ID_STATUS_HTTP_LOOP_FAULT_US,
+  DIAG_ID_STATUS_CAN_SNAPSHOT_US,
+  DIAG_ID_STATUS_CAN_JSON_US,
+  DIAG_ID_STATUS_JSON_TOTAL_US,
+  DIAG_ID_STATUS_RESPONSE_SEND_US,
+  DIAG_ID_STATUS_SYS_HEAP_US,
+  DIAG_ID_STATUS_SYS_DEVICE_US,
+  DIAG_ID_STATUS_SYS_RUNTIME_US,
+  DIAG_ID_STATUS_SYS_HEALTH_US,
+  DIAG_ID_STATUS_SYS_HEALTH_DETAILS_US,
+  DIAG_ID_STATUS_SYS_OTHER_US,
+  DIAG_ID_STATUS_SYS_CHIP_MODEL_US,
+  DIAG_ID_STATUS_SYS_CHIP_REVISION_US,
+  DIAG_ID_STATUS_SYS_CPU_FREQ_US,
+  DIAG_ID_STATUS_SYS_FLASH_SIZE_US,
+  DIAG_ID_STATUS_SYS_SKETCH_SIZE_US,
+  DIAG_ID_STATUS_SYS_FREE_SKETCH_US
 };
 
 #pragma pack(push, 1)
@@ -576,6 +601,35 @@ char serialCommandBuffer[160];
 size_t serialCommandLength = 0;
 bool serialCommandOverflow = false;
 
+// Per-request timing breakdown for GET /api/status. Values are microseconds.
+struct StatusJsonTimings {
+  uint32_t sdRefreshUs = 0;
+  uint32_t sdCardTypeUs = 0;
+  uint32_t sdCardSizeUs = 0;
+  uint32_t sdTotalBytesUs = 0;
+  uint32_t sdUsedBytesUs = 0;
+  uint32_t systemMemoryUs = 0;
+  uint32_t wifiUs = 0;
+  uint32_t sdJsonUs = 0;
+  uint32_t httpLoopFaultUs = 0;
+  uint32_t canSnapshotUs = 0;
+  uint32_t canJsonUs = 0;
+  uint32_t jsonTotalUs = 0;
+  uint32_t responseSendUs = 0;
+  uint32_t systemHeapUs = 0;
+  uint32_t systemDeviceUs = 0;
+  uint32_t systemRuntimeUs = 0;
+  uint32_t systemHealthUs = 0;
+  uint32_t systemHealthDetailsUs = 0;
+  uint32_t systemOtherUs = 0;
+  uint32_t systemChipModelUs = 0;
+  uint32_t systemChipRevisionUs = 0;
+  uint32_t systemCpuFreqUs = 0;
+  uint32_t systemFlashSizeUs = 0;
+  uint32_t systemSketchSizeUs = 0;
+  uint32_t systemFreeSketchUs = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Forward declarations
 // -----------------------------------------------------------------------------
@@ -665,7 +719,7 @@ void canReceiveTask(void *parameter);
 void printCANFrames(uint8_t requestedCount);
 String makeCANFramesJson();
 const char *getCANStateText();
-void refreshSDInformation();
+void refreshSDInformation(StatusJsonTimings *timings = nullptr);
 bool runSDTest();
 
 void configureWebServer();
@@ -679,7 +733,7 @@ void handleHttpErrors();
 void handleLoopEvents();
 void handleNotFound();
 
-String makeStatusJson();
+String makeStatusJson(StatusJsonTimings *timings = nullptr);
 
 String makeEventsJson();
 String makeHttpErrorsJson();
@@ -829,7 +883,7 @@ void loop() {
 }
 
 // -----------------------------------------------------------------------------
-// V08 verbose diagnostic recorder
+// V08c verbose diagnostic recorder
 // -----------------------------------------------------------------------------
 
 uint32_t diagnosticStringHash(const char *text) {
@@ -896,6 +950,31 @@ const char *diagnosticRecordName(uint16_t recordId) {
     case DIAG_ID_CAN_LOG_WRITE_FAILURES: return "CAN_LOG_WRITE_FAILURES";
     case DIAG_ID_CAN_LOG_LAST_WRITE_MS: return "CAN_LOG_LAST_WRITE_MS";
     case DIAG_ID_FAULT_QUEUE_DROPS: return "FAULT_QUEUE_DROPS";
+    case DIAG_ID_STATUS_SD_REFRESH_US: return "STATUS_SD_REFRESH_US";
+    case DIAG_ID_STATUS_SD_CARD_TYPE_US: return "STATUS_SD_CARD_TYPE_US";
+    case DIAG_ID_STATUS_SD_CARD_SIZE_US: return "STATUS_SD_CARD_SIZE_US";
+    case DIAG_ID_STATUS_SD_TOTAL_BYTES_US: return "STATUS_SD_TOTAL_BYTES_US";
+    case DIAG_ID_STATUS_SD_USED_BYTES_US: return "STATUS_SD_USED_BYTES_US";
+    case DIAG_ID_STATUS_SYSTEM_MEMORY_US: return "STATUS_SYSTEM_MEMORY_US";
+    case DIAG_ID_STATUS_WIFI_US: return "STATUS_WIFI_US";
+    case DIAG_ID_STATUS_SD_JSON_US: return "STATUS_SD_JSON_US";
+    case DIAG_ID_STATUS_HTTP_LOOP_FAULT_US: return "STATUS_HTTP_LOOP_FAULT_US";
+    case DIAG_ID_STATUS_CAN_SNAPSHOT_US: return "STATUS_CAN_SNAPSHOT_US";
+    case DIAG_ID_STATUS_CAN_JSON_US: return "STATUS_CAN_JSON_US";
+    case DIAG_ID_STATUS_JSON_TOTAL_US: return "STATUS_JSON_TOTAL_US";
+    case DIAG_ID_STATUS_RESPONSE_SEND_US: return "STATUS_RESPONSE_SEND_US";
+    case DIAG_ID_STATUS_SYS_HEAP_US: return "STATUS_SYS_HEAP_US";
+    case DIAG_ID_STATUS_SYS_DEVICE_US: return "STATUS_SYS_DEVICE_US";
+    case DIAG_ID_STATUS_SYS_RUNTIME_US: return "STATUS_SYS_RUNTIME_US";
+    case DIAG_ID_STATUS_SYS_HEALTH_US: return "STATUS_SYS_HEALTH_US";
+    case DIAG_ID_STATUS_SYS_HEALTH_DETAILS_US: return "STATUS_SYS_HEALTH_DETAILS_US";
+    case DIAG_ID_STATUS_SYS_OTHER_US: return "STATUS_SYS_OTHER_US";
+    case DIAG_ID_STATUS_SYS_CHIP_MODEL_US: return "STATUS_SYS_CHIP_MODEL_US";
+    case DIAG_ID_STATUS_SYS_CHIP_REVISION_US: return "STATUS_SYS_CHIP_REVISION_US";
+    case DIAG_ID_STATUS_SYS_CPU_FREQ_US: return "STATUS_SYS_CPU_FREQ_US";
+    case DIAG_ID_STATUS_SYS_FLASH_SIZE_US: return "STATUS_SYS_FLASH_SIZE_US";
+    case DIAG_ID_STATUS_SYS_SKETCH_SIZE_US: return "STATUS_SYS_SKETCH_SIZE_US";
+    case DIAG_ID_STATUS_SYS_FREE_SKETCH_US: return "STATUS_SYS_FREE_SKETCH_US";
     default: return "UNKNOWN";
   }
 }
@@ -945,7 +1024,7 @@ const char *diagnosticRecordDetail(const DiagnosticRecord &record) {
       default: return "stopped";
     }
   }
-  if (record.recordId == DIAG_ID_BOOT) return "firmware V08 boot/enable marker";
+  if (record.recordId == DIAG_ID_BOOT) return "firmware V08c boot/enable marker";
   return "";
 }
 
@@ -2926,10 +3005,12 @@ void remountSDCard() {
                                          : F("[SD] Remount and verification: FAIL"));
 }
 
-void refreshSDInformation() {
+void refreshSDInformation(StatusJsonTimings *timings) {
   if (!sdReady) return;
 
+  uint32_t operationStartUs = micros();
   uint8_t cardType = SD.cardType();
+  if (timings) timings->sdCardTypeUs = micros() - operationStartUs;
 
   switch (cardType) {
     case CARD_MMC:  sdCardTypeText = "MMC"; break;
@@ -2939,9 +3020,17 @@ void refreshSDInformation() {
     default:        sdCardTypeText = "Unknown"; break;
   }
 
+  operationStartUs = micros();
   sdCardCapacityBytes = SD.cardSize();
+  if (timings) timings->sdCardSizeUs = micros() - operationStartUs;
+
+  operationStartUs = micros();
   sdTotalBytes = SD.totalBytes();
+  if (timings) timings->sdTotalBytesUs = micros() - operationStartUs;
+
+  operationStartUs = micros();
   sdUsedBytes = SD.usedBytes();
+  if (timings) timings->sdUsedBytesUs = micros() - operationStartUs;
 }
 
 // -----------------------------------------------------------------------------
@@ -2978,10 +3067,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V08 - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V08c - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V08 - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V08c - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -3200,10 +3289,50 @@ void handleRoot() {
 void handleStatus() {
   uint32_t startUs = micros();
   httpStatusRequests++;
+  StatusJsonTimings timings = {};
 
-  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation();
-  String json = makeStatusJson();
+  uint32_t phaseStartUs = micros();
+  if (!canLoggingActive && !canLoggingStopping) refreshSDInformation(&timings);
+  timings.sdRefreshUs = micros() - phaseStartUs;
+
+  phaseStartUs = micros();
+  String json = makeStatusJson(&timings);
+  // Includes String construction and all status JSON field generation.
+  uint32_t jsonBuildElapsedUs = micros() - phaseStartUs;
+  timings.jsonTotalUs = jsonBuildElapsedUs;
+
+  phaseStartUs = micros();
   sendHttpResponse(200, "application/json", json);
+  timings.responseSendUs = micros() - phaseStartUs;
+
+  // Record the breakdown after sending the response so recorder writes do not
+  // contaminate the measured JSON construction or response-send intervals.
+  recordDiagnostic(DIAG_ID_STATUS_SD_REFRESH_US, DIAG_TYPE_U32, timings.sdRefreshUs);
+  recordDiagnostic(DIAG_ID_STATUS_SD_CARD_TYPE_US, DIAG_TYPE_U32, timings.sdCardTypeUs);
+  recordDiagnostic(DIAG_ID_STATUS_SD_CARD_SIZE_US, DIAG_TYPE_U32, timings.sdCardSizeUs);
+  recordDiagnostic(DIAG_ID_STATUS_SD_TOTAL_BYTES_US, DIAG_TYPE_U32, timings.sdTotalBytesUs);
+  recordDiagnostic(DIAG_ID_STATUS_SD_USED_BYTES_US, DIAG_TYPE_U32, timings.sdUsedBytesUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYSTEM_MEMORY_US, DIAG_TYPE_U32, timings.systemMemoryUs);
+  recordDiagnostic(DIAG_ID_STATUS_WIFI_US, DIAG_TYPE_U32, timings.wifiUs);
+  recordDiagnostic(DIAG_ID_STATUS_SD_JSON_US, DIAG_TYPE_U32, timings.sdJsonUs);
+  recordDiagnostic(DIAG_ID_STATUS_HTTP_LOOP_FAULT_US, DIAG_TYPE_U32, timings.httpLoopFaultUs);
+  recordDiagnostic(DIAG_ID_STATUS_CAN_SNAPSHOT_US, DIAG_TYPE_U32, timings.canSnapshotUs);
+  recordDiagnostic(DIAG_ID_STATUS_CAN_JSON_US, DIAG_TYPE_U32, timings.canJsonUs);
+  recordDiagnostic(DIAG_ID_STATUS_JSON_TOTAL_US, DIAG_TYPE_U32, timings.jsonTotalUs);
+  recordDiagnostic(DIAG_ID_STATUS_RESPONSE_SEND_US, DIAG_TYPE_U32, timings.responseSendUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_HEAP_US, DIAG_TYPE_U32, timings.systemHeapUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_DEVICE_US, DIAG_TYPE_U32, timings.systemDeviceUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_RUNTIME_US, DIAG_TYPE_U32, timings.systemRuntimeUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_HEALTH_US, DIAG_TYPE_U32, timings.systemHealthUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_HEALTH_DETAILS_US, DIAG_TYPE_U32, timings.systemHealthDetailsUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_OTHER_US, DIAG_TYPE_U32, timings.systemOtherUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_CHIP_MODEL_US, DIAG_TYPE_U32, timings.systemChipModelUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_CHIP_REVISION_US, DIAG_TYPE_U32, timings.systemChipRevisionUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_CPU_FREQ_US, DIAG_TYPE_U32, timings.systemCpuFreqUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_FLASH_SIZE_US, DIAG_TYPE_U32, timings.systemFlashSizeUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_SKETCH_SIZE_US, DIAG_TYPE_U32, timings.systemSketchSizeUs);
+  recordDiagnostic(DIAG_ID_STATUS_SYS_FREE_SKETCH_US, DIAG_TYPE_U32, timings.systemFreeSketchUs);
+
   recordHttp("GET", "/api/status", startUs, 200);
 }
 
@@ -3520,10 +3649,14 @@ void printSystemHealthDetails() {
   Serial.println(getSystemHealthDetails());
 }
 
-String makeStatusJson() {
+String makeStatusJson(StatusJsonTimings *timings) {
+  uint32_t functionStartUs = micros();
+  uint32_t phaseStartUs = functionStartUs;
+  uint32_t systemOperationStartUs = timings ? micros() : 0;
   uint32_t freeHeap = ESP.getFreeHeap();
   uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   uint32_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (timings) timings->systemHeapUs += micros() - systemOperationStartUs;
   float fragmentation = freeHeap ? 100.0f * (1.0f - ((float)largestBlock / (float)freeHeap)) : 0.0f;
 
   uint32_t canFramesReceivedSnapshot, canStandardFramesSnapshot, canExtendedFramesSnapshot;
@@ -3534,6 +3667,7 @@ String makeStatusJson() {
   uint32_t canHistoryCountSnapshot, canLastErrorSnapshot;
   uint64_t canLastFrameTimestampSnapshot;
   bool canRxTaskRunningSnapshot;
+  uint32_t canSnapshotStartUs = micros();
   portENTER_CRITICAL(&canMux);
   canFramesReceivedSnapshot = canFramesReceived;
   canStandardFramesSnapshot = canStandardFrames;
@@ -3556,6 +3690,7 @@ String makeStatusJson() {
   canLastErrorSnapshot = canLastError;
   canRxTaskRunningSnapshot = canRxTaskRunning;
   portEXIT_CRITICAL(&canMux);
+  if (timings) timings->canSnapshotUs = micros() - canSnapshotStartUs;
 
   String json;
   json.reserve(4400);
@@ -3564,25 +3699,126 @@ String makeStatusJson() {
   json += "\"project\":\"" + String(PROJECT_NAME) + "\",";
   json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
   json += "\"build\":\"" + String(BUILD_LABEL) + "\",";
-  json += "\"arduinoCore\":\"" + jsonEscape(getArduinoCoreVersion()) + "\",";
-  json += "\"espIdf\":\"" + jsonEscape(ESP.getSdkVersion()) + "\",";
-  json += "\"chip\":\"" + jsonEscape(ESP.getChipModel()) + "\",";
-  json += "\"chipRevision\":" + String(ESP.getChipRevision()) + ",";
-  json += "\"cpuMHz\":" + String(ESP.getCpuFreqMHz()) + ",";
-  json += "\"flashMB\":" + String((double)ESP.getFlashChipSize() / 1048576.0, 1) + ",";
-  json += "\"sketchKB\":" + String((double)ESP.getSketchSize() / 1024.0, 1) + ",";
-  json += "\"freeSketchKB\":" + String((double)ESP.getFreeSketchSpace() / 1024.0, 1) + ",";
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String arduinoCoreVersion = getArduinoCoreVersion();
+    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
+    json += "\"arduinoCore\":\"" + jsonEscape(arduinoCoreVersion) + "\",";
+  }
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String espIdfVersion = ESP.getSdkVersion();
+    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
+    json += "\"espIdf\":\"" + jsonEscape(espIdfVersion) + "\",";
+  }
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String chipModel = ESP.getChipModel();
+    if (timings) {
+      uint32_t elapsedUs = micros() - systemOperationStartUs;
+      timings->systemChipModelUs += elapsedUs;
+      timings->systemDeviceUs += elapsedUs;
+    }
+    json += "\"chip\":\"" + jsonEscape(chipModel) + "\",";
+  }
+
+  if (timings) systemOperationStartUs = micros();
+  uint32_t chipRevision = ESP.getChipRevision();
+  if (timings) {
+    uint32_t elapsedUs = micros() - systemOperationStartUs;
+    timings->systemChipRevisionUs += elapsedUs;
+    timings->systemDeviceUs += elapsedUs;
+  }
+  json += "\"chipRevision\":" + String(chipRevision) + ",";
+
+  if (timings) systemOperationStartUs = micros();
+  uint32_t cpuMHz = ESP.getCpuFreqMHz();
+  if (timings) {
+    uint32_t elapsedUs = micros() - systemOperationStartUs;
+    timings->systemCpuFreqUs += elapsedUs;
+    timings->systemDeviceUs += elapsedUs;
+  }
+  json += "\"cpuMHz\":" + String(cpuMHz) + ",";
+
+  if (timings) systemOperationStartUs = micros();
+  uint32_t flashChipSize = ESP.getFlashChipSize();
+  if (timings) {
+    uint32_t elapsedUs = micros() - systemOperationStartUs;
+    timings->systemFlashSizeUs += elapsedUs;
+    timings->systemDeviceUs += elapsedUs;
+  }
+  json += "\"flashMB\":" + String((double)flashChipSize / 1048576.0, 1) + ",";
+
+  if (timings) systemOperationStartUs = micros();
+  uint32_t sketchSize = ESP.getSketchSize();
+  if (timings) {
+    uint32_t elapsedUs = micros() - systemOperationStartUs;
+    timings->systemSketchSizeUs += elapsedUs;
+    timings->systemDeviceUs += elapsedUs;
+  }
+  json += "\"sketchKB\":" + String((double)sketchSize / 1024.0, 1) + ",";
+
+  if (timings) systemOperationStartUs = micros();
+  uint32_t freeSketchSpace = ESP.getFreeSketchSpace();
+  if (timings) {
+    uint32_t elapsedUs = micros() - systemOperationStartUs;
+    timings->systemFreeSketchUs += elapsedUs;
+    timings->systemDeviceUs += elapsedUs;
+  }
+  json += "\"freeSketchKB\":" + String((double)freeSketchSpace / 1024.0, 1) + ",";
+
   json += "\"uptimeMs\":" + String(millis() - bootMillis) + ",";
-  json += "\"uptime\":\"" + formatUptime(millis() - bootMillis) + "\",";
-  json += "\"resetReason\":\"" + getResetReasonText() + "\",";
-  json += "\"health\":\"" + getSystemHealth() + "\",";
-  json += "\"healthDetails\":\"" + jsonEscape(getSystemHealthDetails()) + "\",";
+  {
+    if (timings) systemOperationStartUs = micros();
+    String uptimeText = formatUptime(millis() - bootMillis);
+    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
+    json += "\"uptime\":\"" + uptimeText + "\",";
+  }
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String resetReasonText = getResetReasonText();
+    if (timings) timings->systemRuntimeUs += micros() - systemOperationStartUs;
+    json += "\"resetReason\":\"" + resetReasonText + "\",";
+  }
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String systemHealth = getSystemHealth();
+    if (timings) timings->systemHealthUs += micros() - systemOperationStartUs;
+    json += "\"health\":\"" + systemHealth + "\",";
+  }
+
+  {
+    if (timings) systemOperationStartUs = micros();
+    String systemHealthDetails = getSystemHealthDetails();
+    if (timings) timings->systemHealthDetailsUs += micros() - systemOperationStartUs;
+    json += "\"healthDetails\":\"" + jsonEscape(systemHealthDetails) + "\",";
+  }
 
   json += "\"heapFree\":" + String(freeHeap) + ",";
-  json += "\"heapMinimum\":" + String(ESP.getMinFreeHeap()) + ",";
+  if (timings) systemOperationStartUs = micros();
+  uint32_t minimumFreeHeap = ESP.getMinFreeHeap();
+  if (timings) timings->systemHeapUs += micros() - systemOperationStartUs;
+  json += "\"heapMinimum\":" + String(minimumFreeHeap) + ",";
   json += "\"heapLargestBlock\":" + String(largestBlock) + ",";
   json += "\"heapInternalFree\":" + String(internalFree) + ",";
   json += "\"heapFragmentationPercent\":" + String(fragmentation, 1) + ",";
+  if (timings) {
+    timings->systemMemoryUs = (micros() - phaseStartUs) - timings->canSnapshotUs;
+    uint32_t measuredSystemOperationsUs = timings->systemHeapUs +
+                                          timings->systemDeviceUs +
+                                          timings->systemRuntimeUs +
+                                          timings->systemHealthUs +
+                                          timings->systemHealthDetailsUs;
+    timings->systemOtherUs = timings->systemMemoryUs > measuredSystemOperationsUs
+                               ? timings->systemMemoryUs - measuredSystemOperationsUs
+                               : 0;
+  }
+  phaseStartUs = micros();
 
   json += "\"wifiMode\":\"AP+STA\",";
   json += "\"apStarted\":";
@@ -3612,6 +3848,8 @@ String makeStatusJson() {
   json += "\"mdnsStarted\":";
   json += (mdnsStarted ? "true" : "false");
   json += ",\"mdnsHostname\":\"" + String(MDNS_HOSTNAME) + ".local\",";
+  if (timings) timings->wifiUs = micros() - phaseStartUs;
+  phaseStartUs = micros();
 
   json += "\"sdReady\":";
   json += (sdReady ? "true" : "false");
@@ -3637,6 +3875,8 @@ String makeStatusJson() {
   json += "\"sdLastReadMs\":" + String(sdLastReadDurationMs) + ",";
   json += "\"sdMaxReadMs\":" + String(sdMaxReadDurationMs) + ",";
   json += "\"sdAverageReadMs\":" + String(sdReadOperations ? (double)sdTotalReadDurationMs / sdReadOperations : 0.0, 2) + ",";
+  if (timings) timings->sdJsonUs = micros() - phaseStartUs;
+  phaseStartUs = micros();
 
   json += "\"httpRequests\":" + String(httpRequests) + ",";
   json += "\"httpRootRequests\":" + String(httpRootRequests) + ",";
@@ -3670,6 +3910,8 @@ String makeStatusJson() {
   json += "\"faultLogReady\":" + String(faultLogReady ? "true" : "false") + ",";
   json += "\"faultLogWriteFailures\":" + String(faultLogWriteFailures) + ",";
   json += "\"ledState\":\"" + String(getLedPatternText()) + "\",";
+  if (timings) timings->httpLoopFaultUs = micros() - phaseStartUs;
+  phaseStartUs = micros();
   json += "\"canInitialized\":" + String(canInitialized ? "true" : "false") + ",";
   json += "\"canState\":\"" + jsonEscape(canStateText) + "\",";
   json += "\"canBitrate\":" + String(CAN_BITRATE) + ",";
@@ -3709,6 +3951,10 @@ String makeStatusJson() {
   json += "\"sdFileDownloadRequests\":" + String(sdFileDownloadRequests) + ",";
   json += "\"sdFileOperationFailures\":" + String(sdFileOperationFailures);
   json += "}";
+  if (timings) {
+    timings->canJsonUs = micros() - phaseStartUs;
+    timings->jsonTotalUs = micros() - functionStartUs;
+  }
 
   return json;
 }
@@ -3815,7 +4061,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V08</p>
+<p class="sub">System dashboard - V08c</p>
 
 <div class="grid">
   <section class="card">
