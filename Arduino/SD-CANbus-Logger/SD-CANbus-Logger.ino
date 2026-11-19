@@ -1,10 +1,19 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V08e
+  Firmware: V09a
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
+
+  V09a purpose:
+    - Release the diagnostic test lock after LED operator confirmation.
+    - Exercise red, green, and blue LED channels in a sequential visual test.
+    - Add a common user-initiated hardware diagnostic test registry and result model.
+    - Expose the same test services through serial commands and browser APIs/UI.
+    - Provide LED visual confirmation, SD read/write verification, CAN activity
+      observation, and AP/STA connectivity checks.
+    - Keep tests bounded and prevent SD diagnostics from interfering with CAN capture.
 
   V08c purpose (retained in V08e):
     - Cache immutable device/build information at startup; remove expensive
@@ -50,6 +59,9 @@
     httperrors
     loopevents
     checkpoints
+    diag list|status
+    diag run <test>
+    diag confirm pass|fail
     verbose status|on|off|freeze|resume|clear
     verbose interval <ms>
     diag threshold [ms]
@@ -91,6 +103,10 @@
     /api/events       Recent diagnostic events
     /api/http-errors  Recent HTTP 4xx/5xx requests
     /api/loop-events  Recent loop timing anomalies
+    /api/diagnostics  Hardware diagnostic test results
+    /api/diagnostics/status  Hardware diagnostic test results (explicit status route)
+    /api/diagnostics/run  Start a hardware diagnostic (POST test=<id>)
+    /api/diagnostics/confirm Confirm LED visual test (POST result=pass|fail)
     /api/verbose      Verbose recorder status and controls
     /download-verbose Download RAM diagnostic records as CSV
     /api/faults       Active faults and recent fault/recovery events
@@ -132,7 +148,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V08e";
+static const char FIRMWARE_VERSION[] = "V09a";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -461,6 +477,45 @@ bool verboseLoggingEnabled = false;
 bool verboseLoggingFrozen = false;
 portMUX_TYPE diagnosticMux = portMUX_INITIALIZER_UNLOCKED;
 
+
+// -----------------------------------------------------------------------------
+// V09a common hardware diagnostic test framework
+// -----------------------------------------------------------------------------
+
+enum DiagnosticTestId : int8_t {
+  DIAG_TEST_LED = 0,
+  DIAG_TEST_SD,
+  DIAG_TEST_CAN,
+  DIAG_TEST_CONNECTIVITY,
+  DIAG_TEST_COUNT
+};
+
+struct DiagnosticTestResult {
+  const char *id;
+  const char *name;
+  char state[24];       // NOT TESTED, RUNNING, AWAITING_CONFIRMATION, COMPLETE
+  char result[16];      // NOT TESTED, PASS, WARN, FAIL
+  char detail[112];
+  uint32_t lastRunMs;
+  uint32_t durationMs;
+};
+
+DiagnosticTestResult diagnosticTests[DIAG_TEST_COUNT] = {
+  {"led", "LED RGB visual check", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
+  {"sd", "SD write/readback", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
+  {"can", "CAN activity", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
+  {"connectivity", "Wi-Fi connectivity", "NOT TESTED", "NOT TESTED", "Not run", 0, 0}
+};
+
+int8_t diagnosticTestActive = -1;
+uint32_t diagnosticTestStartedMs = 0;
+uint32_t diagnosticCanStartFrames = 0;
+uint32_t diagnosticCanStartMs = 0;
+bool diagnosticLedActive = false;
+bool diagnosticLedAwaitingConfirmation = false;
+uint8_t diagnosticLedPhase = 0; // 0-17: three pulses each for red, green, blue
+uint32_t diagnosticLedNextMs = 0;
+
 // -----------------------------------------------------------------------------
 // Runtime objects
 // -----------------------------------------------------------------------------
@@ -682,6 +737,15 @@ void handleVerboseFreeze();
 void handleVerboseResume();
 void handleVerboseDownload();
 
+bool startDiagnosticTest(const char *testId);
+void serviceDiagnosticTests();
+String makeDiagnosticsJson();
+void printDiagnosticTests();
+void printDiagnosticTestResult(uint8_t index);
+void handleDiagnosticsStatus();
+void handleDiagnosticsRun();
+void handleDiagnosticsConfirm();
+
 void initializeFaultSystem();
 void enqueueFaultEvent(const char *subsystem, const char *eventName,
                        uint16_t code, const char *description);
@@ -699,6 +763,7 @@ void handleFaults();
 void initializeLed();
 void updateLed();
 void setLedRed(uint8_t brightness);
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue);
 void requestLedTransition();
 const char *getLedPatternText();
 void startLedTransitionPattern();
@@ -806,7 +871,7 @@ void setup() {
   Serial.println();
 
   initializeFaultSystem();
-  recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 8, systemInfo.chipRevision);
+  recordDiagnostic(DIAG_ID_BOOT, DIAG_TYPE_EVENT, 9, systemInfo.chipRevision);
   addEvent("INFO", "System startup");
   captureBootCheckpoint("Startup");
 
@@ -895,6 +960,7 @@ void loop() {
   startMDNSIfNeeded();
   serviceFaultLog();  // Diagnostic fault records retain priority over bulk CAN capture writes.
   serviceCANLogger();
+  serviceDiagnosticTests();
   updateLed();
 
   delay(2);
@@ -1050,7 +1116,7 @@ const char *diagnosticRecordDetail(const DiagnosticRecord &record) {
       default: return "stopped";
     }
   }
-  if (record.recordId == DIAG_ID_BOOT) return "firmware V08e boot/enable marker";
+  if (record.recordId == DIAG_ID_BOOT) return "firmware V09a boot/enable marker";
   return "";
 }
 
@@ -2514,12 +2580,16 @@ void updateCANState() {
 // Nonblocking WS2812 LED diagnostics
 // -----------------------------------------------------------------------------
 
-void setLedRed(uint8_t brightness) {
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
   // Arduino-ESP32 3.3.x provides this RMT-backed WS2812 helper. Explicit GRB
-  // order matches the standard WS2812B data order.
+  // order matches the standard WS2812B data order; arguments remain RGB.
   // A one-pixel RMT frame is transmitted synchronously; the application
   // pattern scheduler itself remains nonblocking and calls this only on edges.
-  rgbLedWriteOrdered(RGB_LED_DATA_PIN, LED_COLOR_ORDER_GRB, brightness, 0, 0);
+  rgbLedWriteOrdered(RGB_LED_DATA_PIN, LED_COLOR_ORDER_GRB, red, green, blue);
+}
+
+void setLedRed(uint8_t brightness) {
+  setLedColor(brightness, 0, 0);
 }
 
 void initializeLed() {
@@ -2572,6 +2642,7 @@ void startLedFaultPattern(uint8_t subsystemIndex) {
 
 void updateLed() {
   if (!ledInitialized) return;
+  if (diagnosticLedActive || diagnosticLedAwaitingConfirmation) return;  // Preserve the diagnostic LED result until operator confirmation.
   uint32_t now = millis();
   if ((int32_t)(now - ledNextActionMs) < 0) return;
 
@@ -3109,10 +3180,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V08e - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V09a - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V08e - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V09a - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -3261,6 +3332,274 @@ bool runSDTest() {
 }
 
 // -----------------------------------------------------------------------------
+// V09a common hardware diagnostic test framework
+// -----------------------------------------------------------------------------
+
+void printDiagnosticTestResult(uint8_t index) {
+  if (index >= DIAG_TEST_COUNT) return;
+  const DiagnosticTestResult &test = diagnosticTests[index];
+  Serial.printf("[DIAG] %-13s state=%s result=%s",
+                test.id, test.state, test.result);
+  if (test.durationMs) Serial.printf(" duration=%lu ms", (unsigned long)test.durationMs);
+  Serial.printf(" detail=%s\n", test.detail);
+}
+
+void printDiagnosticTests() {
+  Serial.println();
+  Serial.println(F("HARDWARE DIAGNOSTIC TESTS"));
+  Serial.println(F("-------------------------"));
+  for (uint8_t i = 0; i < DIAG_TEST_COUNT; ++i) printDiagnosticTestResult(i);
+  if (diagnosticTestActive >= 0) {
+    Serial.printf("[DIAG] Active test: %s\n", diagnosticTests[diagnosticTestActive].id);
+  } else if (diagnosticLedAwaitingConfirmation) {
+    Serial.println(F("[DIAG] LED visual check is awaiting operator confirmation."));
+  } else {
+    Serial.println(F("[DIAG] No test running."));
+  }
+}
+
+bool startDiagnosticTest(const char *testId) {
+  if (!testId || !*testId) {
+    Serial.println(F("[DIAG] Specify led, sd, can, or connectivity."));
+    return false;
+  }
+  if (diagnosticTestActive >= 0 || diagnosticLedAwaitingConfirmation) {
+    Serial.println(F("[DIAG] Another test is active or awaiting confirmation."));
+    return false;
+  }
+
+  int8_t index = -1;
+  for (uint8_t i = 0; i < DIAG_TEST_COUNT; ++i) {
+    if (!strcmp(testId, diagnosticTests[i].id)) {
+      index = (int8_t)i;
+      break;
+    }
+  }
+  if (index < 0) {
+    Serial.println(F("[DIAG] Unknown test. Use diag list."));
+    return false;
+  }
+
+  DiagnosticTestResult &test = diagnosticTests[index];
+  snprintf(test.state, sizeof(test.state), "RUNNING");
+  snprintf(test.result, sizeof(test.result), "NOT TESTED");
+  snprintf(test.detail, sizeof(test.detail), "Test in progress");
+  test.lastRunMs = millis();
+  test.durationMs = 0;
+  diagnosticTestStartedMs = millis();
+  diagnosticTestActive = index;
+  addEvent("INFO", "Hardware diagnostic test started");
+
+  Serial.printf("[DIAG] Starting %s...\n", test.id);
+
+  if (index == DIAG_TEST_LED) {
+    if (!ledInitialized) {
+      snprintf(test.state, sizeof(test.state), "COMPLETE");
+      snprintf(test.result, sizeof(test.result), "FAIL");
+      snprintf(test.detail, sizeof(test.detail), "LED driver is not initialized");
+      test.durationMs = millis() - diagnosticTestStartedMs;
+      diagnosticTestActive = -1;
+      printDiagnosticTestResult(index);
+      return true;
+    }
+    diagnosticLedActive = true;
+    diagnosticLedAwaitingConfirmation = false;
+    diagnosticLedPhase = 0;
+    setLedColor(32, 0, 0);
+    diagnosticLedNextMs = millis() + 300;
+    snprintf(test.detail, sizeof(test.detail), "Observe three red, three green, and three blue pulses; then confirm pass or fail");
+    return true;
+  }
+
+  if (index == DIAG_TEST_SD) {
+    // A deliberate resource conflict is not evidence of SD hardware failure.
+    if (canLoggingActive || canLoggingStopping || sdOperationActive || sdTestRunning) {
+      snprintf(test.state, sizeof(test.state), "COMPLETE");
+      snprintf(test.result, sizeof(test.result), "WARN");
+      snprintf(test.detail, sizeof(test.detail), "%s",
+               (canLoggingActive || canLoggingStopping) ?
+               "Not run: CAN capture is active or draining" :
+               "Not run: another SD operation is active");
+      test.durationMs = millis() - diagnosticTestStartedMs;
+      diagnosticTestActive = -1;
+      printDiagnosticTestResult(index);
+      return true;
+    }
+    // Reuse the established SD verification routine and its existing safety
+    // interlocks. This operation is synchronous, as the V08e sdtest is.
+    bool passed = runSDTest();
+    snprintf(test.state, sizeof(test.state), "COMPLETE");
+    snprintf(test.result, sizeof(test.result), "%s", passed ? "PASS" : "FAIL");
+    snprintf(test.detail, sizeof(test.detail), "%s",
+             passed ? "Write, append, and readback verified" : sdLastResult.c_str());
+    test.durationMs = millis() - diagnosticTestStartedMs;
+    diagnosticTestActive = -1;
+    addEvent(passed ? "INFO" : "ERROR", "SD hardware diagnostic completed");
+    printDiagnosticTestResult(index);
+    return true;
+  }
+
+  if (index == DIAG_TEST_CAN) {
+    if (!canInitialized) {
+      snprintf(test.state, sizeof(test.state), "COMPLETE");
+      snprintf(test.result, sizeof(test.result), "FAIL");
+      snprintf(test.detail, sizeof(test.detail), "TWAI controller is not initialized");
+      test.durationMs = millis() - diagnosticTestStartedMs;
+      diagnosticTestActive = -1;
+      printDiagnosticTestResult(index);
+      return true;
+    }
+    diagnosticCanStartFrames = canFramesReceived;
+    diagnosticCanStartMs = millis();
+    snprintf(test.detail, sizeof(test.detail), "Observing CAN receive activity for 5 seconds");
+    return true;
+  }
+
+  if (index == DIAG_TEST_CONNECTIVITY) {
+    bool apOk = wifiApStarted && WiFi.softAPIP() != IPAddress(0, 0, 0, 0);
+    bool staExpected = configuredStaSsid.length() > 0 && !wifiStaManuallyDisconnected;
+    bool staOk = wifiStaConnected && WiFi.status() == WL_CONNECTED;
+    const char *verdict = !apOk ? "FAIL" : (staExpected && !staOk ? "WARN" : "PASS");
+    snprintf(test.state, sizeof(test.state), "COMPLETE");
+    snprintf(test.result, sizeof(test.result), "%s", verdict);
+    if (!apOk) {
+      snprintf(test.detail, sizeof(test.detail), "Access point is not operational");
+    } else if (staExpected && !staOk) {
+      snprintf(test.detail, sizeof(test.detail), "AP operational; configured infrastructure STA is not connected");
+    } else if (staOk) {
+      snprintf(test.detail, sizeof(test.detail), "AP and infrastructure STA are connected");
+    } else {
+      snprintf(test.detail, sizeof(test.detail), "AP operational; no infrastructure STA connection is configured/expected");
+    }
+    test.durationMs = millis() - diagnosticTestStartedMs;
+    diagnosticTestActive = -1;
+    addEvent(!strcmp(verdict, "FAIL") ? "ERROR" :
+             (!strcmp(verdict, "WARN") ? "WARN" : "INFO"),
+             "Wi-Fi connectivity diagnostic completed");
+    printDiagnosticTestResult(index);
+    return true;
+  }
+
+  diagnosticTestActive = -1;
+  return false;
+}
+
+void serviceDiagnosticTests() {
+  if (diagnosticTestActive == DIAG_TEST_CAN) {
+    if ((uint32_t)(millis() - diagnosticCanStartMs) >= 5000) {
+      DiagnosticTestResult &test = diagnosticTests[DIAG_TEST_CAN];
+      uint32_t frames = canFramesReceived - diagnosticCanStartFrames;
+      snprintf(test.state, sizeof(test.state), "COMPLETE");
+      snprintf(test.result, sizeof(test.result), "%s", frames ? "PASS" : "WARN");
+      if (frames) {
+        snprintf(test.detail, sizeof(test.detail),
+                 "%lu frames received during 5-second observation",
+                 (unsigned long)frames);
+      } else {
+        snprintf(test.detail, sizeof(test.detail),
+                 "No frames observed; silence alone does not prove a CAN hardware fault");
+      }
+      test.durationMs = millis() - diagnosticTestStartedMs;
+      diagnosticTestActive = -1;
+      addEvent(frames ? "INFO" : "WARN", "CAN activity diagnostic completed");
+      printDiagnosticTestResult(DIAG_TEST_CAN);
+    }
+  }
+
+  if (diagnosticLedActive && (int32_t)(millis() - diagnosticLedNextMs) >= 0) {
+    diagnosticLedPhase++;
+    if (diagnosticLedPhase >= 18) {
+      setLedColor(0, 0, 0);
+      diagnosticLedActive = false;
+      diagnosticLedAwaitingConfirmation = true;
+      DiagnosticTestResult &test = diagnosticTests[DIAG_TEST_LED];
+      snprintf(test.state, sizeof(test.state), "AWAITING_CONFIRMATION");
+      snprintf(test.result, sizeof(test.result), "NOT TESTED");
+      snprintf(test.detail, sizeof(test.detail), "Three red, three green, and three blue pulses displayed; operator confirmation required");
+      test.durationMs = millis() - diagnosticTestStartedMs;
+      Serial.println(F("[DIAG] LED RGB sequence complete. Inspect red, green, and blue pulses, then enter: diag confirm pass|fail"));
+      return;
+    }
+    uint8_t colorPhase = diagnosticLedPhase / 6;
+    bool colorOn = (diagnosticLedPhase % 2) == 0;
+    uint8_t level = colorOn ? 32 : 0;
+    if (colorPhase == 0) setLedColor(level, 0, 0);
+    else if (colorPhase == 1) setLedColor(0, level, 0);
+    else setLedColor(0, 0, level);
+    diagnosticLedNextMs = millis() + 300;
+  }
+}
+
+String makeDiagnosticsJson() {
+  String json;
+  json.reserve(900);
+  json = "{\"active\":";
+  if (diagnosticTestActive >= 0) {
+    json += "\""; json += diagnosticTests[diagnosticTestActive].id; json += "\"";
+  } else if (diagnosticLedAwaitingConfirmation) {
+    json += "\"led_confirmation\"";
+  } else {
+    json += "null";
+  }
+  json += ",\"tests\":[";
+  for (uint8_t i = 0; i < DIAG_TEST_COUNT; ++i) {
+    if (i) json += ",";
+    const DiagnosticTestResult &test = diagnosticTests[i];
+    json += "{\"id\":\""; json += test.id;
+    json += "\",\"name\":\""; json += jsonEscape(String(test.name));
+    json += "\",\"state\":\""; json += test.state;
+    json += "\",\"result\":\""; json += test.result;
+    json += "\",\"detail\":\""; json += jsonEscape(String(test.detail));
+    json += "\",\"last_run_ms\":"; json += String(test.lastRunMs);
+    json += ",\"duration_ms\":"; json += String(test.durationMs);
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
+
+void handleDiagnosticsStatus() {
+  uint32_t started = micros();
+  sendHttpResponse(200, "application/json", makeDiagnosticsJson());
+  recordHttp("GET", "/api/diagnostics", started, 200);
+}
+
+void handleDiagnosticsRun() {
+  uint32_t started = micros();
+  String testId = server.arg("test");
+  bool accepted = startDiagnosticTest(testId.c_str());
+  sendHttpResponse(accepted ? 202 : 409, "application/json", makeDiagnosticsJson());
+  recordHttp("POST", "/api/diagnostics/run", started, accepted ? 202 : 409);
+}
+
+void completeLedDiagnostic(bool passed) {
+  DiagnosticTestResult &test = diagnosticTests[DIAG_TEST_LED];
+  diagnosticLedAwaitingConfirmation = false;
+  diagnosticTestActive = -1;  // Release the global diagnostic lock after operator confirmation.
+  snprintf(test.state, sizeof(test.state), "COMPLETE");
+  snprintf(test.result, sizeof(test.result), "%s", passed ? "PASS" : "FAIL");
+  snprintf(test.detail, sizeof(test.detail), "%s",
+           passed ? "Operator confirmed visible red, green, and blue LED output" :
+                    "Operator reported one or more RGB LED outputs were not correct");
+  addEvent(passed ? "INFO" : "ERROR", passed ?
+           "LED RGB visual diagnostic confirmed by operator" :
+           "LED RGB visual diagnostic failed by operator confirmation");
+  printDiagnosticTestResult(DIAG_TEST_LED);
+}
+
+void handleDiagnosticsConfirm() {
+  uint32_t started = micros();
+  String verdict = server.arg("result");
+  bool valid = diagnosticLedAwaitingConfirmation &&
+               (verdict == "pass" || verdict == "fail");
+  if (valid) {
+    completeLedDiagnostic(verdict == "pass");
+  }
+  sendHttpResponse(valid ? 200 : 409, "application/json", makeDiagnosticsJson());
+  recordHttp("POST", "/api/diagnostics/confirm", started, valid ? 200 : 409);
+}
+
+// -----------------------------------------------------------------------------
 // HTTP server and instrumentation
 // -----------------------------------------------------------------------------
 
@@ -3274,6 +3613,10 @@ void configureWebServer() {
   server.on("/api/events", HTTP_GET, handleEvents);
   server.on("/api/http-errors", HTTP_GET, handleHttpErrors);
   server.on("/api/loop-events", HTTP_GET, handleLoopEvents);
+  server.on("/api/diagnostics", HTTP_GET, handleDiagnosticsStatus);
+  server.on("/api/diagnostics/status", HTTP_GET, handleDiagnosticsStatus);
+  server.on("/api/diagnostics/run", HTTP_POST, handleDiagnosticsRun);
+  server.on("/api/diagnostics/confirm", HTTP_POST, handleDiagnosticsConfirm);
   server.on("/api/verbose", HTTP_GET, handleVerboseStatus);
   server.on("/api/verbose/start", HTTP_POST, handleVerboseStart);
   server.on("/api/verbose/stop", HTTP_POST, handleVerboseStop);
@@ -4069,9 +4412,28 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V08e</p>
+<p class="sub">System dashboard - V09a</p>
 
 <div class="grid">
+  <section class="card">
+    <h2>Hardware diagnostics</h2>
+    <p class="small muted">Run individual checks. The LED test requires visual confirmation; CAN silence is reported as a warning, not a hardware failure.</p>
+    <div>
+      <button onclick="runDiagnostic('led')">LED</button>
+      <button onclick="runDiagnostic('sd')">SD</button>
+      <button onclick="runDiagnostic('can')">CAN activity</button>
+      <button onclick="runDiagnostic('connectivity')">Wi-Fi</button>
+      <button class="secondary" onclick="refreshDiagnostics()">Refresh</button>
+    </div>
+    <div id="diagnosticTests" class="small">Loading diagnostic results...</div>
+    <div id="diagnosticConfirm" hidden>
+      <p>Inspect the LED output. Did the LED pulse red, then green, then blue (three pulses per color)?</p>
+      <button onclick="confirmDiagnostic('pass')">Pass</button>
+      <button class="secondary" onclick="confirmDiagnostic('fail')">Fail</button>
+    </div>
+    <p id="diagnosticMessage" class="small"></p>
+  </section>
+
   <section class="card">
     <h2>System health</h2>
     <div class="row"><span>Overall</span><span class="health" id="health">--</span></div>
@@ -4412,6 +4774,59 @@ function freezeVerbose(){verboseAction('/api/verbose/freeze','Buffer frozen');}
 function resumeVerbose(){verboseAction('/api/verbose/resume','Recording resumed');}
 function clearVerbose(){if(confirm('Clear the retained verbose diagnostic records?'))verboseAction('/api/verbose/clear','Buffer cleared');}
 
+async function refreshDiagnostics(){
+  try{
+    const data=await fetchJson('/api/diagnostics');
+    const host=document.getElementById('diagnosticTests');
+    host.replaceChildren();
+    data.tests.forEach(test=>{
+      const row=document.createElement('div');
+      row.className='row';
+      const label=document.createElement('span');
+      label.textContent=test.name;
+      const value=document.createElement('span');
+      value.className='value';
+      value.textContent=test.state+' / '+test.result+' — '+test.detail;
+      row.append(label,value);
+      host.appendChild(row);
+    });
+    document.getElementById('diagnosticConfirm').hidden=
+      !(data.tests.some(t=>t.id==='led'&&t.state==='AWAITING_CONFIRMATION'));
+    if(data.active) setText('diagnosticMessage','Running: '+data.active);
+  }catch(e){
+    setText('diagnosticMessage','Diagnostic status unavailable: '+e.message);
+  }
+}
+async function runDiagnostic(testId){
+  setText('diagnosticMessage','Starting '+testId+' diagnostic...');
+  try{
+    const response=await fetch('/api/diagnostics/run',{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'test='+encodeURIComponent(testId)
+    });
+    const data=await response.json();
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    setText('diagnosticMessage',testId+' diagnostic accepted.');
+    await refreshDiagnostics();
+  }catch(e){
+    setText('diagnosticMessage','Diagnostic request rejected: '+e.message);
+    await refreshDiagnostics();
+  }
+}
+async function confirmDiagnostic(result){
+  try{
+    const response=await fetch('/api/diagnostics/confirm',{
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'result='+encodeURIComponent(result)
+    });
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    setText('diagnosticMessage','LED result recorded: '+result.toUpperCase());
+    await refreshDiagnostics();
+  }catch(e){setText('diagnosticMessage','LED confirmation failed: '+e.message);}
+}
+
 async function refreshStatus(){
   try{
     const s=await fetchJson('/api/status');
@@ -4561,6 +4976,7 @@ refreshCanFrames();
 refreshFiles();
 refreshLogging();
 refreshVerbose();
+refreshDiagnostics();
 setInterval(refreshStatus,5000);
 setInterval(refreshFaults,15000);
 setInterval(refreshEvents,15000);
@@ -4568,6 +4984,7 @@ setInterval(refreshHttpErrors,15000);
 setInterval(refreshLoopEvents,15000);
 setInterval(refreshCanFrames,5000);
 setInterval(refreshLogging,5000);
+setInterval(refreshDiagnostics,5000);
 </script>
 </body>
 </html>
@@ -4648,6 +5065,16 @@ void processSerialCommand(char *command) {
     printLoopEvents();
   } else if (!strcmp(command, "checkpoints")) {
     printBootCheckpoints();
+  } else if (!strcmp(command, "diag list") || !strcmp(command, "diag status")) {
+    printDiagnosticTests();
+  } else if (!strncmp(command, "diag run ", 9)) {
+    startDiagnosticTest(command + 9);
+  } else if (!strcmp(command, "diag confirm pass")) {
+    if (diagnosticLedAwaitingConfirmation) completeLedDiagnostic(true);
+    else Serial.println(F("[DIAG] No LED test is awaiting confirmation."));
+  } else if (!strcmp(command, "diag confirm fail")) {
+    if (diagnosticLedAwaitingConfirmation) completeLedDiagnostic(false);
+    else Serial.println(F("[DIAG] No LED test is awaiting confirmation."));
   } else if (!strcmp(command, "verbose status")) {
     printVerboseStatus();
   } else if (!strcmp(command, "verbose on")) {
@@ -4805,6 +5232,9 @@ void printHelp() {
   Serial.println(F("httperrors                   Recent HTTP 4xx/5xx requests"));
   Serial.println(F("loopevents                   Recent loop timing anomalies (configured threshold)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
+  Serial.println(F("diag list/status              List hardware diagnostic tests and results"));
+  Serial.println(F("diag run <test>               Run led, sd, can, or connectivity test"));
+  Serial.println(F("diag confirm pass|fail        Confirm the LED visual test result"));
   Serial.println(F("verbose status               Verbose recorder status"));
   Serial.println(F("verbose on/off               Enable/disable RAM diagnostic recording"));
   Serial.println(F("verbose freeze/resume        Freeze/resume the RAM record buffer"));
