@@ -1,18 +1,21 @@
 /*
   SD-CANbus-Logger.ino
-  Firmware: V09a
+  Firmware: V10
 
   Project: SD-CANbus-Logger
   Target: ESP32-D0WD-V3-based CAN logger hardware
   Framework target: Arduino-ESP32 3.3.x / ESP-IDF 5.x
 
-  V09a purpose:
+  V10 purpose:
     - Release the diagnostic test lock after LED operator confirmation.
     - Exercise red, green, and blue LED channels in a sequential visual test.
     - Add a common user-initiated hardware diagnostic test registry and result model.
     - Expose the same test services through serial commands and browser APIs/UI.
     - Provide LED visual confirmation, SD read/write verification, CAN activity
-      observation, and AP/STA connectivity checks.
+      observation, and AP/STA Wi-Fi checks.
+    - Organize the browser interface into focused pages with page-aware polling.
+    - Shorten the RGB diagnostic sequence and identify the network test as Wi-Fi.
+    - Finalize an active CAN capture before a controlled software reset.
     - Keep tests bounded and prevent SD diagnostics from interfering with CAN capture.
 
   V08c purpose (retained in V08e):
@@ -148,7 +151,7 @@
 // -----------------------------------------------------------------------------
 
 static const char PROJECT_NAME[] = "SD-CANbus-Logger";
-static const char FIRMWARE_VERSION[] = "V09a";
+static const char FIRMWARE_VERSION[] = "V10";
 static const char BUILD_LABEL[] = __DATE__ " " __TIME__;
 
 static const char WIFI_AP_SSID[] = "SD-CANbus-Logger";
@@ -479,14 +482,14 @@ portMUX_TYPE diagnosticMux = portMUX_INITIALIZER_UNLOCKED;
 
 
 // -----------------------------------------------------------------------------
-// V09a common hardware diagnostic test framework
+// V10 hardware diagnostic test framework
 // -----------------------------------------------------------------------------
 
 enum DiagnosticTestId : int8_t {
   DIAG_TEST_LED = 0,
   DIAG_TEST_SD,
   DIAG_TEST_CAN,
-  DIAG_TEST_CONNECTIVITY,
+  DIAG_TEST_WIFI,
   DIAG_TEST_COUNT
 };
 
@@ -504,7 +507,7 @@ DiagnosticTestResult diagnosticTests[DIAG_TEST_COUNT] = {
   {"led", "LED RGB visual check", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
   {"sd", "SD write/readback", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
   {"can", "CAN activity", "NOT TESTED", "NOT TESTED", "Not run", 0, 0},
-  {"connectivity", "Wi-Fi connectivity", "NOT TESTED", "NOT TESTED", "Not run", 0, 0}
+  {"wifi", "Wi-Fi AP/STA status", "NOT TESTED", "NOT TESTED", "Not run", 0, 0}
 };
 
 int8_t diagnosticTestActive = -1;
@@ -515,6 +518,7 @@ bool diagnosticLedActive = false;
 bool diagnosticLedAwaitingConfirmation = false;
 uint8_t diagnosticLedPhase = 0; // 0-17: three pulses each for red, green, blue
 uint32_t diagnosticLedNextMs = 0;
+static const uint32_t DIAGNOSTIC_LED_PHASE_MS = 100;
 
 // -----------------------------------------------------------------------------
 // Runtime objects
@@ -789,6 +793,7 @@ void handleFileList();
 void handleFileView();
 void handleFileDownload();
 void handleResetRequest();
+bool finalizeCaptureForReset(uint32_t timeoutMs = 5000);
 void requestSoftwareReset(const char *source);
 void flushPendingFaultEvents(uint32_t timeoutMs);
 void initializeCANController();
@@ -1116,7 +1121,7 @@ const char *diagnosticRecordDetail(const DiagnosticRecord &record) {
       default: return "stopped";
     }
   }
-  if (record.recordId == DIAG_ID_BOOT) return "firmware V09a boot/enable marker";
+  if (record.recordId == DIAG_ID_BOOT) return "firmware V10 boot/enable marker";
   return "";
 }
 
@@ -2011,9 +2016,31 @@ void flushPendingFaultEvents(uint32_t timeoutMs) {
   }
 }
 
+bool finalizeCaptureForReset(uint32_t timeoutMs) {
+  if (!canLogFileOpen) return true;
+
+  Serial.println(F("[SYSTEM] Finalizing active CAN capture before reset..."));
+  stopCANLogging(false);
+  uint32_t startedMs = millis();
+  while (canLogFileOpen && (uint32_t)(millis() - startedMs) < timeoutMs) {
+    serviceCANLogger();
+    if (canLogFileOpen) vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  if (canLogFileOpen) {
+    Serial.println(F("[SYSTEM] Reset aborted: CAN capture did not finalize before timeout."));
+    addEvent("ERROR", "Software reset aborted because CAN capture finalization timed out");
+    return false;
+  }
+
+  Serial.println(F("[SYSTEM] Active CAN capture finalized."));
+  return true;
+}
+
 void requestSoftwareReset(const char *source) {
   Serial.print(F("[SYSTEM] Software reset requested through "));
   Serial.println(source);
+  if (!finalizeCaptureForReset()) return;
   addEvent("WARN", "Software reset requested");
   flushPendingFaultEvents(1000);
   Serial.flush();
@@ -2024,6 +2051,11 @@ void requestSoftwareReset(const char *source) {
 void handleResetRequest() {
   uint32_t started = micros();
   server.sendHeader("Cache-Control", "no-store");
+  if (!finalizeCaptureForReset()) {
+    server.send(503, "text/plain", "Restart aborted: CAN capture could not be finalized");
+    recordHttp("POST", "/api/reset", started, 503);
+    return;
+  }
   server.send(202, "text/plain", "Software restart requested");
   recordHttp("POST", "/api/reset", started, 202);
   flushPendingFaultEvents(1000);
@@ -3180,10 +3212,10 @@ bool runSDTest() {
   char secondRecord[96];
 
   snprintf(firstRecord, sizeof(firstRecord),
-           "SD-CANbus-Logger V09a - TEST %lu - WRITE PASS",
+           "SD-CANbus-Logger V10 - TEST %lu - WRITE PASS",
            (unsigned long)sdTestCount);
   snprintf(secondRecord, sizeof(secondRecord),
-           "SD-CANbus-Logger V09a - TEST %lu - APPEND PASS",
+           "SD-CANbus-Logger V10 - TEST %lu - APPEND PASS",
            (unsigned long)sdTestCount);
 
   Serial.println();
@@ -3332,7 +3364,7 @@ bool runSDTest() {
 }
 
 // -----------------------------------------------------------------------------
-// V09a common hardware diagnostic test framework
+// V10 hardware diagnostic test framework
 // -----------------------------------------------------------------------------
 
 void printDiagnosticTestResult(uint8_t index) {
@@ -3360,7 +3392,7 @@ void printDiagnosticTests() {
 
 bool startDiagnosticTest(const char *testId) {
   if (!testId || !*testId) {
-    Serial.println(F("[DIAG] Specify led, sd, can, or connectivity."));
+    Serial.println(F("[DIAG] Specify led, sd, can, or wifi."));
     return false;
   }
   if (diagnosticTestActive >= 0 || diagnosticLedAwaitingConfirmation) {
@@ -3406,7 +3438,7 @@ bool startDiagnosticTest(const char *testId) {
     diagnosticLedAwaitingConfirmation = false;
     diagnosticLedPhase = 0;
     setLedColor(32, 0, 0);
-    diagnosticLedNextMs = millis() + 300;
+    diagnosticLedNextMs = millis() + DIAGNOSTIC_LED_PHASE_MS;
     snprintf(test.detail, sizeof(test.detail), "Observe three red, three green, and three blue pulses; then confirm pass or fail");
     return true;
   }
@@ -3455,7 +3487,7 @@ bool startDiagnosticTest(const char *testId) {
     return true;
   }
 
-  if (index == DIAG_TEST_CONNECTIVITY) {
+  if (index == DIAG_TEST_WIFI) {
     bool apOk = wifiApStarted && WiFi.softAPIP() != IPAddress(0, 0, 0, 0);
     bool staExpected = configuredStaSsid.length() > 0 && !wifiStaManuallyDisconnected;
     bool staOk = wifiStaConnected && WiFi.status() == WL_CONNECTED;
@@ -3475,7 +3507,7 @@ bool startDiagnosticTest(const char *testId) {
     diagnosticTestActive = -1;
     addEvent(!strcmp(verdict, "FAIL") ? "ERROR" :
              (!strcmp(verdict, "WARN") ? "WARN" : "INFO"),
-             "Wi-Fi connectivity diagnostic completed");
+             "Wi-Fi diagnostic completed");
     printDiagnosticTestResult(index);
     return true;
   }
@@ -3526,7 +3558,7 @@ void serviceDiagnosticTests() {
     if (colorPhase == 0) setLedColor(level, 0, 0);
     else if (colorPhase == 1) setLedColor(0, level, 0);
     else setLedColor(0, 0, level);
-    diagnosticLedNextMs = millis() + 300;
+    diagnosticLedNextMs = millis() + DIAGNOSTIC_LED_PHASE_MS;
   }
 }
 
@@ -4375,7 +4407,7 @@ String makeLoopEventsJson() {
 
 String htmlPage() {
   String page;
-  page.reserve(32000);
+  page.reserve(42000);
 
   page += R"rawliteral(
 <!DOCTYPE html>
@@ -4387,7 +4419,18 @@ String htmlPage() {
 <style>
 :root{font-family:Arial,sans-serif;color:#202833;background:#f2f4f7}
 body{margin:0;padding:18px}
-main{max-width:1050px;margin:auto}
+main{max-width:1180px;margin:auto}
+.page-nav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px;padding:8px;background:#e7ebf2;border-radius:10px}
+.page-nav button{margin:0;padding:9px 12px;background:#475467}
+.page-nav button.active{background:#155eef}
+.page-panel{display:none}
+.page-panel.active{display:block}
+.page-heading{margin:2px 0 12px}
+.page-description{color:#667085;font-size:.88rem;margin:-6px 0 14px}
+.page-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px;align-items:start}
+.page-grid>.card{margin:0}
+.page-grid>.card:only-child{max-width:none}
+@media(max-width:600px){body{padding:10px}.page-nav{gap:4px}.page-nav button{font-size:.82rem;padding:8px 9px}}
 h1{font-size:1.55rem;margin:0 0 4px}
 h2{font-size:1.12rem;margin:0 0 12px}
 h3{font-size:1rem;margin:0 0 9px}
@@ -4412,9 +4455,19 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <body>
 <main>
 <h1>SD-CANbus-Logger</h1>
-<p class="sub">System dashboard - V09a</p>
+<p class="sub">Browser interface - V10</p>
+<nav class="page-nav" aria-label="Main navigation">
+  <button type="button" data-page="overview" onclick="showPage('overview')">Overview</button>
+  <button type="button" data-page="can" onclick="showPage('can')">CAN Monitor</button>
+  <button type="button" data-page="logging" onclick="showPage('logging')">CAN Logging</button>
+  <button type="button" data-page="diagnostics" onclick="showPage('diagnostics')">Hardware Diagnostics</button>
+  <button type="button" data-page="system" onclick="showPage('system')">System</button>
+  <button type="button" data-page="files" onclick="showPage('files')">Files &amp; Tools</button>
+  <button type="button" data-page="help" onclick="showPage('help')">Help / About</button>
+</nav>
+<div id="pageHost"></div>
 
-<div class="grid">
+<div class="grid" id="legacyCardGrid">
   <section class="card">
     <h2>Hardware diagnostics</h2>
     <p class="small muted">Run individual checks. The LED test requires visual confirmation; CAN silence is reported as a warning, not a hardware failure.</p>
@@ -4422,7 +4475,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
       <button onclick="runDiagnostic('led')">LED</button>
       <button onclick="runDiagnostic('sd')">SD</button>
       <button onclick="runDiagnostic('can')">CAN activity</button>
-      <button onclick="runDiagnostic('connectivity')">Wi-Fi</button>
+      <button onclick="runDiagnostic('wifi')">Wi-Fi</button>
       <button class="secondary" onclick="refreshDiagnostics()">Refresh</button>
     </div>
     <div id="diagnosticTests" class="small">Loading diagnostic results...</div>
@@ -4536,6 +4589,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
     <div class="row"><span>Timing events captured</span><span class="value" id="loopTimingEvents">--</span></div>
     <div id="loopEvents" class="small muted">No loop timing history loaded.</div>
     <div class="row"><span>Diagnostic events retained</span><span class="value" id="eventCount">--</span></div>
+  </section>
+
+  <section class="card">
+    <h2>CAN controller</h2>
     <div class="row"><span>Controller</span><span class="value" id="canState">--</span></div>
     <div class="row"><span>Receive task</span><span class="value" id="canRxTask">--</span></div>
     <div class="row"><span>Mode / bitrate</span><span class="value">Listen-only / 250 kbit/s</span></div>
@@ -4613,7 +4670,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 <section class="card">
   <h2>System control</h2>
   <button class="secondary" onclick="requestReset()">Restart device</button>
-  <p class="small muted">Performs a controlled software restart. The Wi-Fi access point and dashboard will be temporarily unavailable.</p>
+  <p class="small muted">An active CAN capture is stopped, drained, and closed before restart. If capture finalization cannot complete within 5 seconds, the restart is aborted. The Wi-Fi access point and dashboard will be temporarily unavailable.</p>
 </section>
 
 <section class="card">
@@ -4633,6 +4690,68 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8fafc;padding:10px;
 
 <script>
 let captureAccessPaused=false;
+let activePageId='overview';
+const dashboardPages=[
+  {id:'overview',title:'Overview',description:'Device condition and key operating indicators.'},
+  {id:'can',title:'CAN Monitor',description:'Live CAN reception and recent frame history.'},
+  {id:'logging',title:'CAN Logging',description:'Start, stop, and inspect binary CAN captures.'},
+  {id:'diagnostics',title:'Hardware Diagnostics',description:'Run explicit hardware checks and review subsystem results.'},
+  {id:'system',title:'System',description:'Network, memory, timing, fault, and firmware diagnostics.'},
+  {id:'files',title:'Files & Tools',description:'Inspect diagnostic files and access maintenance functions.'},
+  {id:'help',title:'Help / About',description:'Device operation, access, and firmware information.'}
+];
+const dashboardCardPages={
+  'System health':'overview','Device identity':'overview','Memory':'overview','Fault diagnostics':'overview',
+  'Recent CAN frames':'can','CAN controller':'can','CAN capture':'logging',
+  'Hardware diagnostics':'diagnostics','microSD':'diagnostics','SD operation diagnostics':'diagnostics','SD verification':'diagnostics',
+  'Wi-Fi access point':'system','Infrastructure Wi-Fi':'system','HTTP diagnostics':'system','Main-loop diagnostics':'system',
+  'Verbose diagnostic recording':'system','System control':'system','Boot memory checkpoints':'system','Recent diagnostic events':'system',
+  'SD diagnostic files':'files'
+};
+function organizeDashboardPages(){
+  const host=document.getElementById('pageHost');
+  const panels={};
+  dashboardPages.forEach(page=>{
+    const panel=document.createElement('section');
+    panel.className='page-panel';panel.id='page-'+page.id;
+    const heading=document.createElement('h2');heading.className='page-heading';heading.textContent=page.title;
+    const description=document.createElement('p');description.className='page-description';description.textContent=page.description;
+    const grid=document.createElement('div');grid.className='page-grid';
+    panel.append(heading,description,grid);host.appendChild(panel);panels[page.id]=grid;
+  });
+  const cards=Array.from(document.querySelectorAll('#legacyCardGrid > .card, main > .card'));
+  cards.forEach(card=>{
+    const heading=card.querySelector('h2');
+    const title=heading?heading.textContent.trim():'';
+    const target=dashboardCardPages[title]||'system';
+    panels[target].appendChild(card);
+  });
+  const legacy=document.getElementById('legacyCardGrid');
+  if(legacy)legacy.remove();
+  const help=document.createElement('section');help.className='card';
+  help.innerHTML='<h2>Help / About</h2><p>SD-CANbus-Logger is a local-first CAN monitoring and logging device. The browser interface is hosted by the device; internet access and a dedicated application are not required.</p><div class="row"><span>Firmware</span><span class="value">V10</span></div><div class="row"><span>Local access point</span><span class="value">192.168.4.1</span></div><div class="row"><span>mDNS</span><span class="value">sd-canbus-logger.local</span></div><p class="small muted">CAN operates at 250 kbit/s in listen-only mode. Captures are stored as versioned binary files under /diag and can be converted offline with the supplied BIN-to-ASC utility. Stop capture before browsing or downloading SD files.</p><p class="small muted">Infrastructure Wi-Fi credentials are configured through the USB serial command interface. The access point remains available as a recovery interface.</p>';
+  panels.help.appendChild(help);
+}
+function showPage(pageId){
+  if(!dashboardPages.some(page=>page.id===pageId))pageId='overview';
+  activePageId=pageId;
+  document.querySelectorAll('.page-panel').forEach(panel=>panel.classList.toggle('active',panel.id==='page-'+pageId));
+  document.querySelectorAll('.page-nav button[data-page]').forEach(button=>{
+    const selected=button.dataset.page===pageId;
+    button.classList.toggle('active',selected);
+    if(selected)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current');
+  });
+  refreshActivePage();
+}
+function refreshActivePage(){
+  switch(activePageId){
+    case 'overview': refreshFaults(); break;
+    case 'can': refreshCanFrames(); break;
+    case 'diagnostics': refreshDiagnostics(); break;
+    case 'system': refreshFaults();refreshEvents();refreshHttpErrors();refreshLoopEvents();refreshVerbose();break;
+    case 'files': refreshFiles();break;
+  }
+}
 function setText(id,value){document.getElementById(id).textContent=value;}
 function showCaptureFilePause(){
   const host=document.getElementById('sdFiles');
@@ -4699,7 +4818,7 @@ async function viewFile(name){
   }catch(e){preview.textContent='File view failed: '+e.message;}
 }
 async function requestReset(){
-  if(!confirm('Restart SD-CANbus-Logger now? The dashboard connection will be interrupted.')) return;
+  if(!confirm('Restart SD-CANbus-Logger now? If CAN capture is active, it will be stopped and finalized first. The dashboard connection will be interrupted.')) return;
   try{
     const response=await fetch('/api/reset',{method:'POST'});
     if(!response.ok) throw new Error('HTTP '+response.status);
@@ -4967,24 +5086,15 @@ async function refreshLoopEvents(){
     host.style.whiteSpace='pre-wrap';
   }catch(e){document.getElementById('loopEvents').textContent='Loop history unavailable: '+e.message;}
 }
+organizeDashboardPages();
+showPage('overview');
 refreshStatus();
-refreshFaults();
-refreshEvents();
-refreshHttpErrors();
-refreshLoopEvents();
-refreshCanFrames();
-refreshFiles();
 refreshLogging();
-refreshVerbose();
-refreshDiagnostics();
 setInterval(refreshStatus,5000);
-setInterval(refreshFaults,15000);
-setInterval(refreshEvents,15000);
-setInterval(refreshHttpErrors,15000);
-setInterval(refreshLoopEvents,15000);
-setInterval(refreshCanFrames,5000);
+// Logging state remains polled on every page because it gates SD file access.
 setInterval(refreshLogging,5000);
-setInterval(refreshDiagnostics,5000);
+// Other page-specific endpoints are polled only while their page is visible.
+setInterval(refreshActivePage,5000);
 </script>
 </body>
 </html>
@@ -5233,7 +5343,7 @@ void printHelp() {
   Serial.println(F("loopevents                   Recent loop timing anomalies (configured threshold)"));
   Serial.println(F("checkpoints                  Boot memory checkpoints"));
   Serial.println(F("diag list/status              List hardware diagnostic tests and results"));
-  Serial.println(F("diag run <test>               Run led, sd, can, or connectivity test"));
+  Serial.println(F("diag run <test>               Run led, sd, can, or wifi test"));
   Serial.println(F("diag confirm pass|fail        Confirm the LED visual test result"));
   Serial.println(F("verbose status               Verbose recorder status"));
   Serial.println(F("verbose on/off               Enable/disable RAM diagnostic recording"));
@@ -5248,7 +5358,7 @@ void printHelp() {
   Serial.println(F("log status                   Show CAN logging counters"));
   Serial.println(F("sdtest                       Run SD write/append/readback test"));
   Serial.println(F("sd remount                    Unmount, remount, and verify the SD card"));
-  Serial.println(F("reset                        Controlled software restart"));
+  Serial.println(F("reset                        Finalize active capture, then restart"));
   Serial.println(F("ls [path]                    List /diag files (default /diag)"));
   Serial.println(F("cat <path>                   Display complete diagnostic file"));
   Serial.println(F("head <path> [lines]          Display first N lines (default 10)"));
